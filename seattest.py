@@ -3,8 +3,6 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import json
-from datetime import datetime
 from io import StringIO
 
 # ============================================================================
@@ -12,8 +10,8 @@ from io import StringIO
 # ============================================================================
 
 st.set_page_config(
-    page_title="Seat Allocation System",
-    page_icon="🎓",
+    page_title="Seat Allocation Percentage Analysis",
+    page_icon="📊",
     layout="wide"
 )
 
@@ -21,610 +19,111 @@ st.set_page_config(
 # CONSTANTS
 # ============================================================================
 
-# Original seat matrix from the problem
+# Expected seat matrix
 SEAT_MATRIX = {
     'SM': 50, 'EW': 10, 'EZ': 9, 'MU': 8, 'SC': 8, 
     'BH': 3, 'LA': 3, 'DV': 2, 'VK': 2, 'ST': 2, 
     'KN': 1, 'BX': 1, 'KU': 1
 }
 
+# Expected percentages
+TOTAL_EXPECTED = sum(SEAT_MATRIX.values())
+EXPECTED_PERCENTAGES = {
+    cat: (seats / TOTAL_EXPECTED * 100) for cat, seats in SEAT_MATRIX.items()
+}
+
 # ============================================================================
-# DATA PROCESSING FUNCTIONS
+# DATA PROCESSING
 # ============================================================================
 
-def process_allocated_data(data):
+def analyze_percentage_breakup(data):
     """
-    Process the allocated data to show summary statistics
+    Analyze percentage breakup for each category within each program/specialty
     """
-    # Summary by Category
-    category_summary = data.groupby('Category')['Seats'].sum().reset_index()
-    category_summary['Expected'] = category_summary['Category'].map(SEAT_MATRIX)
-    category_summary['Difference'] = category_summary['Seats'] - category_summary['Expected']
-    category_summary['Accuracy'] = (category_summary['Seats'] / category_summary['Expected'] * 100).round(1)
+    total_seats = data['Seats'].sum()
     
-    # Summary by College
-    college_summary = data.groupby('College')['Seats'].sum().reset_index()
-    college_summary = college_summary.sort_values('Seats', ascending=False)
+    # Group by Program and Category to get distribution
+    program_category = data.groupby(['Program', 'Category'])['Seats'].sum().reset_index()
     
-    # Summary by Specialty
-    specialty_summary = data.groupby('Specialty')['Seats'].sum().reset_index()
-    specialty_summary = specialty_summary.sort_values('Seats', ascending=False)
+    # Get total per program
+    program_totals = data.groupby('Program')['Seats'].sum().reset_index()
+    program_totals.columns = ['Program', 'Program_Total']
     
-    # Summary by Program
-    program_summary = data.groupby('Program')['Seats'].sum().reset_index()
+    # Merge to get percentages
+    program_category = program_category.merge(program_totals, on='Program')
+    program_category['Actual_Percent'] = (program_category['Seats'] / program_category['Program_Total'] * 100).round(2)
     
-    # College-Specialty-Category breakdown
-    pivot_csc = data.pivot_table(
-        index=['College', 'Specialty'],
-        columns='Category',
-        values='Seats',
-        fill_value=0
-    ).reset_index()
+    # Add expected percentage
+    program_category['Expected_Percent'] = program_category['Category'].map(EXPECTED_PERCENTAGES).round(2)
+    program_category['Percent_Difference'] = (program_category['Actual_Percent'] - program_category['Expected_Percent']).round(2)
+    
+    # Add expected seats
+    program_category['Expected_Seats'] = (program_category['Program_Total'] * program_category['Expected_Percent'] / 100).round(0).astype(int)
+    program_category['Seats_Difference'] = program_category['Seats'] - program_category['Expected_Seats']
+    
+    # Flag if percentage is within tolerance (±2%)
+    program_category['Within_Tolerance'] = abs(program_category['Percent_Difference']) <= 2
+    program_category['Status'] = program_category['Within_Tolerance'].map({True: '✅', False: '⚠️'})
+    
+    # Similar analysis by Specialty
+    specialty_category = data.groupby(['Specialty', 'Category'])['Seats'].sum().reset_index()
+    specialty_totals = data.groupby('Specialty')['Seats'].sum().reset_index()
+    specialty_totals.columns = ['Specialty', 'Specialty_Total']
+    specialty_category = specialty_category.merge(specialty_totals, on='Specialty')
+    specialty_category['Actual_Percent'] = (specialty_category['Seats'] / specialty_category['Specialty_Total'] * 100).round(2)
+    specialty_category['Expected_Percent'] = specialty_category['Category'].map(EXPECTED_PERCENTAGES).round(2)
+    specialty_category['Percent_Difference'] = (specialty_category['Actual_Percent'] - specialty_category['Expected_Percent']).round(2)
+    specialty_category['Expected_Seats'] = (specialty_category['Specialty_Total'] * specialty_category['Expected_Percent'] / 100).round(0).astype(int)
+    specialty_category['Seats_Difference'] = specialty_category['Seats'] - specialty_category['Expected_Seats']
+    specialty_category['Within_Tolerance'] = abs(specialty_category['Percent_Difference']) <= 2
+    specialty_category['Status'] = specialty_category['Within_Tolerance'].map({True: '✅', False: '⚠️'})
+    
+    # Overall category summary
+    overall_category = data.groupby('Category')['Seats'].sum().reset_index()
+    overall_category['Expected'] = overall_category['Category'].map(SEAT_MATRIX)
+    overall_category['Difference'] = overall_category['Seats'] - overall_category['Expected']
+    overall_category['Actual_Percent'] = (overall_category['Seats'] / total_seats * 100).round(2)
+    overall_category['Expected_Percent'] = overall_category['Category'].map(EXPECTED_PERCENTAGES).round(2)
+    overall_category['Percent_Difference'] = (overall_category['Actual_Percent'] - overall_category['Expected_Percent']).round(2)
+    overall_category['Status'] = overall_category.apply(
+        lambda row: '✅' if abs(row['Percent_Difference']) <= 2 else '⚠️', 
+        axis=1
+    )
     
     return {
-        'category_summary': category_summary,
-        'college_summary': college_summary,
-        'specialty_summary': specialty_summary,
-        'program_summary': program_summary,
-        'pivot_csc': pivot_csc,
-        'total_seats': int(data['Seats'].sum()),
-        'total_categories': int(len(data['Category'].unique())),
-        'total_colleges': int(len(data['College'].unique())),
-        'total_specialties': int(len(data['Specialty'].unique()))
+        'program_category': program_category,
+        'specialty_category': specialty_category,
+        'overall_category': overall_category,
+        'program_totals': program_totals,
+        'specialty_totals': specialty_totals,
+        'total_seats': total_seats
     }
 
-def validate_allocations(data):
-    """
-    Validate that allocations match the seat matrix
-    """
-    validation_results = []
-    
-    # Check each category
-    for category, expected in SEAT_MATRIX.items():
-        actual = data[data['Category'] == category]['Seats'].sum()
-        status = '✅' if actual == expected else '⚠️'
-        validation_results.append({
-            'Category': category,
-            'Expected': int(expected),
-            'Actual': int(actual),
-            'Difference': int(actual - expected),
-            'Status': status
-        })
-    
-    # Check total
-    total_actual = data['Seats'].sum()
-    total_expected = sum(SEAT_MATRIX.values())
-    status = '✅' if total_actual == total_expected else '⚠️'
-    validation_results.append({
-        'Category': 'TOTAL',
-        'Expected': int(total_expected),
-        'Actual': int(total_actual),
-        'Difference': int(total_actual - total_expected),
-        'Status': status
-    })
-    
-    return pd.DataFrame(validation_results)
-
-# ============================================================================
-# SAMPLE DATA
-# ============================================================================
-
 def get_sample_data():
-    """Create sample data with the format you provided"""
+    """Create sample data with your structure"""
     data = """Program,Specialty,College,Type,Category,Seats
-E,CU,KSD,G,SM,2
-E,CU,KSD,G,BH,1
-E,CU,MDL,G,SM,2
-E,CU,MDL,G,BH,1
-E,CU,PRP,G,SM,2
-E,CU,PRP,G,BH,1
-E,ID,KSD,G,SM,1
-E,ID,KSD,G,ST,1
-E,ID,KSD,G,BH,1
-E,ES,LBT,G,SM,1
-E,ES,LBT,G,BH,1
-E,ES,LBT,G,VK,1
-E,ES,PRN,G,SM,1
-E,ES,PRN,G,EZ,1
-E,ES,PRN,G,BH,1
-E,ES,TLY,G,SM,1
-E,ES,TLY,G,BH,1
-E,ES,TLY,G,LA,1
-E,AD,CEC,G,SM,1
-E,AD,CEC,G,BH,1
-E,AD,CEC,G,VK,1
-E,AD,KNP,G,SM,1
-E,AD,KNP,G,BH,1
-E,AD,KNP,G,DV,1
-E,AD,LBT,G,SM,1
-E,AD,LBT,G,ST,1
-E,AD,LBT,G,BH,1
-E,AD,PRN,G,SM,1
-E,AD,PRN,G,BH,1
-E,AD,PRN,G,VK,1
-E,AD,UCE,G,SM,1
-E,AD,UCE,G,BH,1
-E,AD,UCE,G,LA,1
-E,CL,CEA,G,SM,2
-E,CL,CEA,G,BH,1
-E,CL,CEK,G,SM,2
-E,CL,CEK,G,LA,1
-E,CL,CHN,G,SM,2
-E,CL,CHN,G,LA,1
-E,CL,SCT,G,SM,1
-E,CL,SCT,G,BX,1
-E,CV,WYD,G,SM,1
-E,CV,WYD,G,KN,1
-E,CO,ADR,G,SM,2
-E,CO,ADR,G,BH,1
-E,CO,TKR,G,SM,1
-E,EB,MDL,G,SM,2
-E,EB,MDL,G,VK,1
-E,EV,MDL,G,SM,2
-E,EV,MDL,G,DV,1
-E,EP,UCC,G,SM,1
-E,PT,UCC,G,SM,1
-E,PO,UCE,G,SM,2
-E,PO,UCE,G,BH,1
-E,CT,TKR,G,SM,1
-E,MA,SCT,G,SM,1
-E,MA,SCT,G,ST,1
-E,MA,SCT,G,LA,1
-E,CY,PTA,G,SM,1
-E,CY,PTA,G,ST,1
-E,CY,PTA,G,LA,1
-E,CY,UCE,G,SM,1
-E,CY,UCE,G,ST,1
-E,CY,UCE,G,LA,1
-E,BB,SCT,G,SM,1
-E,BB,SCT,G,DV,1
-E,BB,SCT,G,VK,1
-E,IE,TVE,G,SM,1
-E,IE,TVE,G,EZ,1
-E,IE,TVE,G,VK,1
-E,PE,TCR,G,SM,2
-E,PE,TCR,G,EW,1
-E,PE,TCR,G,EZ,1
-E,IT,IDK,G,SM,2
-E,IT,IDK,G,EW,1
-E,IT,IDK,G,EZ,1
-E,IT,PKD,G,SM,2
-E,IT,PKD,G,EW,1
-E,IT,PKD,G,EZ,1
-E,IT,PKD,G,MU,1
-E,IT,TRV,G,SM,1
-E,IT,TRV,G,KN,1
-E,IT,KSD,G,SM,1
-E,IT,KSD,G,DV,1
-E,IT,KSD,G,VK,1
-E,IT,LBT,G,SM,1
-E,IT,LBT,G,ST,1
-E,IT,LBT,G,LA,1
-E,IT,TLY,G,SM,2
-E,IT,TLY,G,LA,1
-E,IT,UCK,G,SM,2
-E,IT,UCK,G,EW,1
-E,IT,VDA,G,SM,2
-E,IT,VDA,G,LA,1
-E,ME,IDK,G,SM,2
-E,ME,IDK,G,EW,1
-E,ME,KKE,G,SM,2
-E,ME,KKE,G,EW,1
-E,ME,KNR,G,SM,2
-E,ME,KNR,G,EZ,1
-E,ME,KTE,G,SM,2
-E,ME,KTE,G,EW,1
-E,ME,NSS,G,SM,3
-E,ME,NSS,G,EW,1
-E,ME,NSS,G,EZ,1
-E,ME,PKD,G,SM,2
-E,ME,PKD,G,LA,1
-E,ME,TCR,G,SM,3
-E,ME,TCR,G,EW,1
-E,ME,TCR,G,EZ,1
-E,ME,TRV,G,SM,1
-E,ME,TRV,G,DV,1
-E,ME,TRV,G,VK,1
-E,ME,TVE,G,SM,2
-E,ME,TVE,G,EW,1
-E,ME,TVE,G,EZ,1
-E,ME,WYD,G,SM,1
-E,ME,WYD,G,DV,1
-E,ME,WYD,G,VK,1
-E,ME,ADR,G,SM,1
-E,ME,ADR,G,ST,1
-E,ME,ADR,G,DV,1
-E,ME,CEM,G,SM,1
-E,ME,CEM,G,EW,1
-E,ME,CEM,G,LA,1
-E,ME,KNP,G,KN,1
-E,ME,KSD,G,SM,1
-E,ME,KSD,G,EW,1
-E,ME,KSD,G,VK,1
-E,ME,MDL,G,SM,2
-E,ME,MDL,G,LA,1
-E,ME,MNR,G,SM,1
-E,ME,MNR,G,SC,1
-E,ME,MNR,G,MU,1
-E,ME,PEC,G,SM,2
-E,ME,PEC,G,SC,1
-E,ME,PRN,G,SM,1
-E,ME,PRN,G,EW,1
-E,ME,PRN,G,MU,1
-E,ME,PRP,G,SM,1
-E,ME,PRP,G,EW,1
-E,ME,PRP,G,SC,1
-E,ME,SCT,G,SM,3
-E,ME,SCT,G,EW,1
-E,ME,SCT,G,SC,1
-E,ME,SCT,G,EZ,1
-E,ME,TLY,G,SM,1
-E,ME,TLY,G,SC,1
-E,ME,TLY,G,MU,1
-E,ME,UCC,G,SM,1
-E,ME,UCC,G,SC,1
-E,ME,UCC,G,DV,1
-E,RA,IDK,G,SM,1
-E,RA,IDK,G,KN,1
-E,RA,KTE,G,SM,1
-E,RA,KTE,G,BX,1
-E,EE,IDK,G,SM,2
-E,EE,IDK,G,EZ,1
-E,EE,KNR,G,SM,2
-E,EE,KNR,G,SC,1
-E,EE,KTE,G,SM,2
-E,EE,KTE,G,SC,1
-E,EE,NSS,G,SM,3
-E,EE,NSS,G,EW,1
-E,EE,NSS,G,EZ,1
-E,EE,PKD,G,SM,2
-E,EE,PKD,G,EZ,1
-E,EE,TCR,G,SM,3
-E,EE,TCR,G,EW,1
-E,EE,TCR,G,EZ,1
-E,EE,TRV,G,SM,2
-E,EE,TRV,G,EW,1
-E,EE,TVE,G,SM,3
-E,EE,TVE,G,EW,1
-E,EE,TVE,G,EZ,1
-E,EE,WYD,G,SM,2
-E,EE,WYD,G,EW,1
-E,EE,ADR,G,SM,2
-E,EE,ADR,G,EW,1
-E,EE,CEA,G,SM,2
-E,EE,CEA,G,MU,1
-E,EE,CEC,G,KU,1
-E,EE,CEM,G,SM,1
-E,EE,CEM,G,SC,1
-E,EE,CEM,G,MU,1
-E,EE,CHN,G,SM,1
-E,EE,CHN,G,SC,1
-E,EE,CHN,G,MU,1
-E,EE,KGR,G,KU,1
-E,EE,KSD,G,SM,1
-E,EE,KSD,G,SC,1
-E,EE,KSD,G,MU,1
-E,EE,MDL,G,SM,1
-E,EE,MDL,G,EW,1
-E,EE,MDL,G,SC,1
-E,EE,MNR,G,SM,1
-E,EE,MNR,G,SC,1
-E,EE,MNR,G,MU,1
-E,EE,PEC,G,SM,1
-E,EE,PEC,G,SC,1
-E,EE,PEC,G,MU,1
-E,EE,PRN,G,SM,1
-E,EE,PRN,G,SC,1
-E,EE,PRN,G,EZ,1
-E,EE,PRP,G,KU,1
-E,EE,PTA,G,KU,1
-E,EE,TKR,G,SM,1
-E,EE,TKR,G,SC,1
-E,EE,TKR,G,MU,1
-E,EE,TLY,G,SM,1
-E,EE,TLY,G,SC,1
-E,EE,TLY,G,MU,1
-E,EE,UCC,G,SM,1
-E,EE,UCC,G,SC,1
-E,EE,UCC,G,MU,1
-E,EE,UCE,G,SM,1
-E,EE,UCE,G,SC,1
-E,EE,UCE,G,MU,1
-E,EE,VDA,G,SM,2
-E,EE,VDA,G,SC,1
-E,EC,IDK,G,SM,2
-E,EC,IDK,G,EW,1
-E,EC,IDK,G,EZ,1
-E,EC,KKE,G,SM,2
-E,EC,KKE,G,SC,1
-E,EC,KNR,G,SM,2
-E,EC,KNR,G,MU,1
-E,EC,KTE,G,SM,1
-E,EC,NSS,G,SM,3
-E,EC,NSS,G,EW,1
-E,EC,NSS,G,EZ,1
-E,EC,PKD,G,SM,2
-E,EC,PKD,G,MU,1
-E,EC,TCR,G,SM,3
-E,EC,TCR,G,EW,1
-E,EC,TCR,G,EZ,1
-E,EC,TRV,G,SM,2
-E,EC,TRV,G,MU,1
-E,EC,TVE,G,SM,2
-E,EC,TVE,G,EZ,1
-E,EC,WYD,G,SM,3
-E,EC,WYD,G,EW,1
-E,EC,WYD,G,SC,1
-E,EC,WYD,G,EZ,1
-E,EC,WYD,G,MU,1
-E,EC,ADR,G,SM,2
-E,EC,ADR,G,SC,1
-E,EC,AEC,G,SM,2
-E,EC,AEC,G,MU,1
-E,EC,CEA,G,SM,2
-E,EC,CEA,G,MU,1
-E,EC,CEC,G,SM,2
-E,EC,CEC,G,EZ,1
-E,EC,CEM,G,SM,2
-E,EC,CEM,G,MU,1
-E,EC,CHN,G,SM,3
-E,EC,CHN,G,EW,1
-E,EC,CHN,G,SC,1
-E,EC,CHN,G,EZ,1
-E,EC,KGR,G,SM,3
-E,EC,KGR,G,EW,1
-E,EC,KGR,G,EZ,1
-E,EC,KGR,G,MU,1
-E,EC,KNP,G,SM,1
-E,EC,KNP,G,SC,1
-E,EC,KNP,G,MU,1
-E,EC,KSD,G,SM,1
-E,EC,KSD,G,SC,1
-E,EC,KSD,G,MU,1
-E,EC,LBT,G,SM,2
-E,EC,LBT,G,MU,1
-E,EC,MDL,G,SM,3
-E,EC,MDL,G,EW,1
-E,EC,MDL,G,SC,1
-E,EC,MDL,G,EZ,1
-E,EC,MNR,G,SM,1
-E,EC,MNR,G,SC,1
-E,EC,MNR,G,MU,1
-E,EC,PEC,G,SM,1
-E,EC,PEC,G,SC,1
-E,EC,PEC,G,MU,1
-E,EC,PJR,G,KN,1
-E,EC,PRN,G,SM,3
-E,EC,PRN,G,EW,1
-E,EC,PRN,G,EZ,1
-E,EC,PRN,G,MU,1
-E,EC,PRP,G,SM,2
-E,EC,PRP,G,SC,1
-E,EC,PTA,G,SM,2
-E,EC,PTA,G,MU,1
-E,EC,SCT,G,SM,3
-E,EC,SCT,G,EW,1
-E,EC,SCT,G,SC,1
-E,EC,SCT,G,EZ,1
-E,EC,TKR,G,SM,2
-E,EC,TKR,G,EW,1
-E,EC,TKR,G,EZ,1
-E,EC,TLY,G,SM,3
-E,EC,TLY,G,EW,1
-E,EC,TLY,G,SC,1
-E,EC,TLY,G,EZ,1
-E,EC,UCC,G,SM,1
-E,EC,UCC,G,BX,1
-E,EC,UCE,G,SM,1
-E,EC,UCE,G,MU,1
-E,EC,UCE,G,BH,1
-E,EC,UCK,G,SM,2
-E,EC,UCK,G,ST,1
-E,EC,VDA,G,SM,2
-E,EC,VDA,G,MU,1
-E,FT,COU,G,SM,3
-E,FT,COU,G,EW,1
-E,FT,COU,G,SC,1
-E,FT,COU,G,EZ,1
-E,FT,COU,G,MU,1
-E,FT,KCT,G,SM,1
-E,FT,KCT,G,BX,1
-E,CS,IDK,G,SM,2
-E,CS,IDK,G,EW,1
-E,CS,IDK,G,EZ,1
-E,CS,KNR,G,KU,1
-E,CS,KTE,G,SM,2
-E,CS,KTE,G,SC,1
-E,CS,NSS,G,SM,3
-E,CS,NSS,G,EW,1
-E,CS,NSS,G,EZ,1
-E,CS,PKD,G,SM,1
-E,CS,PKD,G,ST,1
-E,CS,PKD,G,DV,1
-E,CS,TCR,G,BX,1
-E,CS,WYD,G,SM,2
-E,CS,WYD,G,ST,1
-E,CS,ADR,G,SM,3
-E,CS,ADR,G,EW,1
-E,CS,ADR,G,EZ,1
-E,CS,ADR,G,MU,1
-E,CS,AEC,G,SM,2
-E,CS,AEC,G,EW,1
-E,CS,CEA,G,SM,3
-E,CS,CEA,G,EW,1
-E,CS,CEA,G,SC,1
-E,CS,CEA,G,EZ,1
-E,CS,CEA,G,MU,1
-E,CS,CEC,G,SM,3
-E,CS,CEC,G,EW,1
-E,CS,CEC,G,EZ,1
-E,CS,CEC,G,MU,1
-E,CS,CEK,G,SM,3
-E,CS,CEK,G,EW,1
-E,CS,CEK,G,EZ,1
-E,CS,CEK,G,MU,1
-E,CS,CEM,G,SM,3
-E,CS,CEM,G,EW,1
-E,CS,CEM,G,SC,1
-E,CS,CEM,G,EZ,1
-E,CS,CHN,G,SM,5
-E,CS,CHN,G,EW,1
-E,CS,CHN,G,SC,1
-E,CS,CHN,G,EZ,1
-E,CS,CHN,G,MU,1
-E,CS,KGR,G,SM,3
-E,CS,KGR,G,EW,1
-E,CS,KGR,G,EZ,1
-E,CS,KGR,G,MU,1
-E,CS,KNP,G,SM,3
-E,CS,KNP,G,EW,1
-E,CS,KNP,G,EZ,1
-E,CS,KNP,G,MU,1
-E,CS,KSD,G,SM,3
-E,CS,KSD,G,EW,1
-E,CS,KSD,G,SC,1
-E,CS,KSD,G,EZ,1
-E,CS,KSD,G,MU,1
-E,CS,LBT,G,SM,4
-E,CS,LBT,G,EW,1
-E,CS,LBT,G,SC,1
-E,CS,LBT,G,EZ,1
-E,CS,LBT,G,MU,1
-E,CS,LBT,G,BH,1
-E,CS,MDL,G,SM,4
-E,CS,MDL,G,EW,1
-E,CS,MDL,G,SC,1
-E,CS,MDL,G,EZ,1
-E,CS,MDL,G,MU,1
-E,CS,MNR,G,SM,1
-E,CS,MNR,G,EW,1
-E,CS,MNR,G,LA,1
-E,CS,PEC,G,SM,1
-E,CS,PEC,G,SC,1
-E,CS,PEC,G,MU,1
-E,CS,PJR,G,SM,2
-E,CS,PJR,G,EW,1
-E,CS,PJR,G,EZ,1
-E,CS,PRN,G,SM,3
-E,CS,PRN,G,EW,1
-E,CS,PRN,G,SC,1
-E,CS,PRN,G,EZ,1
-E,CS,PRP,G,SM,3
-E,CS,PRP,G,EW,1
-E,CS,PRP,G,SC,1
-E,CS,PRP,G,EZ,1
-E,CS,PTA,G,SM,3
-E,CS,PTA,G,EW,1
-E,CS,PTA,G,EZ,1
-E,CS,PTA,G,MU,1
-E,CS,SCT,G,SM,3
-E,CS,SCT,G,EW,1
-E,CS,SCT,G,SC,1
-E,CS,SCT,G,EZ,1
-E,CS,TKR,G,SM,3
-E,CS,TKR,G,EW,1
-E,CS,TKR,G,SC,1
-E,CS,TKR,G,EZ,1
-E,CS,TLY,G,SM,3
-E,CS,TLY,G,EW,1
-E,CS,TLY,G,SC,1
-E,CS,TLY,G,EZ,1
-E,CS,UCC,G,SM,2
-E,CS,UCC,G,SC,1
-E,CS,UCE,G,SM,2
-E,CS,UCE,G,MU,1
-E,CS,UCK,G,SM,3
-E,CS,UCK,G,EW,1
-E,CS,UCK,G,EZ,1
-E,CS,UCK,G,MU,1
-E,CS,VDA,G,SM,2
-E,CS,VDA,G,MU,1
-E,AG,KCT,G,SM,2
-E,AG,KCT,G,EW,1
-E,AG,KCT,G,EZ,1
-E,AJ,KCT,G,SM,1
-E,AJ,KCT,G,KN,1
-E,EL,KKE,G,SM,1
-E,EL,KKE,G,DV,1
-E,EL,TVE,G,SM,1
-E,EL,TVE,G,KN,1
-E,EL,KGR,G,KN,1
-E,EL,PRP,G,BX,1
-E,IC,NSS,G,SM,1
-E,IC,NSS,G,EZ,1
-E,IC,NSS,G,MU,1
-E,CB,TCR,G,SM,1
-E,CB,TCR,G,BX,1
-E,CB,PTA,G,KU,1
-E,CH,KKE,G,SM,1
-E,CH,KKE,G,SC,1
-E,CH,KKE,G,MU,1
-E,CH,TCR,G,SM,3
-E,CH,TCR,G,EW,1
-E,CH,TCR,G,SC,1
-E,CH,TCR,G,EZ,1
-E,CG,KKE,G,SM,2
-E,CG,KKE,G,LA,1
-E,AE,KKE,G,SM,2
-E,AE,KKE,G,EW,1
-E,AE,KKE,G,EZ,1
-E,AE,TVE,G,SM,1
-E,AE,TVE,G,SC,1
-E,AE,TVE,G,MU,1
-E,CE,KKE,G,SM,1
-E,CE,KKE,G,SC,1
-E,CE,KKE,G,MU,1
-E,CE,KNR,G,SM,1
-E,CE,KNR,G,SC,1
-E,CE,KNR,G,MU,1
-E,CE,KTE,G,SM,3
-E,CE,KTE,G,EW,1
-E,CE,KTE,G,EZ,1
-E,CE,NSS,G,SM,2
-E,CE,NSS,G,EW,1
-E,CE,NSS,G,EZ,1
-E,CE,NSS,G,MU,1
-E,CE,PKD,G,SM,1
-E,CE,PKD,G,ST,1
-E,CE,PKD,G,LA,1
-E,CE,TCR,G,SM,3
-E,CE,TCR,G,EW,1
-E,CE,TCR,G,SC,1
-E,CE,TCR,G,EZ,1
-E,CE,TRV,G,SM,2
-E,CE,TRV,G,EW,1
-E,CE,TVE,G,SM,1
-E,CE,TVE,G,ST,1
-E,CE,TVE,G,VK,1
-E,CE,AEC,G,SM,1
-E,CE,AEC,G,EW,1
-E,CE,AEC,G,ST,1
-E,CE,CEM,G,SM,1
-E,CE,CEM,G,LA,1
-E,CE,CEM,G,DV,1
-E,CE,KGR,G,SM,1
-E,CE,KGR,G,BH,1
-E,CE,KGR,G,LA,1
-E,CE,KSD,G,SM,2
-E,CE,KSD,G,BH,1
-E,CE,LBT,G,SM,2
-E,CE,LBT,G,VK,1
-E,CE,PEC,G,SM,2
-E,CE,PEC,G,DV,1
-E,CE,PRP,G,SM,2
-E,CE,PRP,G,DV,1
-E,CE,TKR,G,SM,2
-E,CE,TKR,G,VK,1
-E,CE,TLY,G,SM,2
-E,CE,TLY,G,LA,1
-E,CE,VDA,G,SM,2
-E,CE,VDA,G,BH,1
-E,DS,CDI,G,KU,1
-E,DS,CDP,G,BX,1
-E,DS,CDT,G,SM,2
-E,DS,CDT,G,EW,1
-E,DS,CDT,G,EZ,1
-E,DS,CDV,G,SM,1"""
+CS,IDK,some_college,G,SM,2
+CS,IDK,some_college,G,EW,1
+CS,IDK,some_college,G,EZ,1
+CS,NSS,some_college,G,SM,3
+CS,NSS,some_college,G,EW,1
+CS,NSS,some_college,G,EZ,1
+CS,LBT,some_college,G,SM,4
+CS,LBT,some_college,G,EW,1
+CS,LBT,some_college,G,SC,1
+CS,LBT,some_college,G,EZ,1
+CS,LBT,some_college,G,MU,1
+CS,LBT,some_college,G,BH,1
+CS,MDL,some_college,G,SM,4
+CS,MDL,some_college,G,EW,1
+CS,MDL,some_college,G,SC,1
+CS,MDL,some_college,G,EZ,1
+CS,MDL,some_college,G,MU,1
+CS,CHN,some_college,G,SM,5
+CS,CHN,some_college,G,EW,1
+CS,CHN,some_college,G,SC,1
+CS,CHN,some_college,G,EZ,1
+CS,CHN,some_college,G,MU,1"""
     
     df = pd.read_csv(StringIO(data))
     return df
@@ -633,139 +132,117 @@ E,DS,CDV,G,SM,1"""
 # VISUALIZATION FUNCTIONS
 # ============================================================================
 
-def create_category_chart(summary_data):
-    """Create category distribution chart"""
+def create_percentage_comparison_chart(data, group_col):
+    """Create bar chart comparing actual vs expected percentages"""
     fig = go.Figure()
     
-    fig.add_trace(go.Bar(
-        x=summary_data['Category'],
-        y=summary_data['Seats'],
-        name='Allocated',
-        marker_color='#2ca02c',
-        text=summary_data['Seats'],
-        textposition='outside'
-    ))
+    # Get unique categories
+    categories = data['Category'].unique()
     
-    fig.add_trace(go.Bar(
-        x=summary_data['Category'],
-        y=summary_data['Expected'],
-        name='Expected',
-        marker_color='#1f77b4',
-        text=summary_data['Expected'],
-        textposition='outside'
-    ))
+    for cat in categories:
+        cat_data = data[data['Category'] == cat]
+        
+        fig.add_trace(go.Bar(
+            name=f'{cat} (Expected)',
+            x=cat_data[group_col],
+            y=cat_data['Expected_Percent'],
+            marker_color='lightgray',
+            opacity=0.5,
+            legendgroup=cat,
+            showlegend=True
+        ))
+        
+        fig.add_trace(go.Bar(
+            name=f'{cat} (Actual)',
+            x=cat_data[group_col],
+            y=cat_data['Actual_Percent'],
+            marker_color=px.colors.qualitative.Set3[list(categories).index(cat) % len(px.colors.qualitative.Set3)],
+            legendgroup=cat,
+            showlegend=True
+        ))
     
     fig.update_layout(
-        title='Category-wise Seat Allocation',
-        xaxis_title='Category',
-        yaxis_title='Number of Seats',
+        title='Actual vs Expected Percentage Distribution',
+        xaxis_title=group_col,
+        yaxis_title='Percentage (%)',
         barmode='group',
-        height=400,
-        legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99)
+        height=500,
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
     )
     
     return fig
 
-def create_college_chart(college_summary, top_n=20):
-    """Create college distribution chart"""
-    top_colleges = college_summary.head(top_n)
-    
-    fig = px.bar(
-        top_colleges,
-        x='College',
-        y='Seats',
-        title=f'Top {top_n} Colleges by Seat Allocation',
-        color='Seats',
-        color_continuous_scale='Viridis',
-        text='Seats'
-    )
-    fig.update_traces(textposition='outside')
-    fig.update_layout(height=500)
-    
-    return fig
-
-def create_specialty_chart(specialty_summary, top_n=15):
-    """Create specialty distribution chart"""
-    top_specialties = specialty_summary.head(top_n)
-    
-    fig = px.bar(
-        top_specialties,
-        x='Specialty',
-        y='Seats',
-        title=f'Top {top_n} Specialties by Seat Allocation',
-        color='Seats',
-        color_continuous_scale='Plasma',
-        text='Seats'
-    )
-    fig.update_traces(textposition='outside')
-    fig.update_layout(height=500)
-    
-    return fig
-
-def create_heatmap(data):
-    """Create heatmap of allocations"""
-    pivot = data.pivot_table(
-        index='College',
+def create_percentage_deviation_chart(data, group_col):
+    """Create chart showing percentage deviations"""
+    # Pivot for heatmap
+    pivot_data = data.pivot_table(
+        index=group_col,
         columns='Category',
-        values='Seats',
-        fill_value=0,
-        aggfunc='sum'
+        values='Percent_Difference',
+        fill_value=0
     )
-    
-    # Filter to top colleges and categories for readability
-    top_colleges = data.groupby('College')['Seats'].sum().nlargest(20).index
-    top_categories = data.groupby('Category')['Seats'].sum().nlargest(10).index
-    
-    pivot = pivot.loc[top_colleges, top_categories]
     
     fig = px.imshow(
-        pivot,
-        title='Seat Allocation Heatmap (Top 20 Colleges x Top 10 Categories)',
-        color_continuous_scale='Viridis',
-        text_auto=True,
+        pivot_data,
+        title=f'Percentage Deviation from Expected ({group_col} level)',
+        color_continuous_scale='RdYlGn',
+        color_continuous_midpoint=0,
+        text_auto='.1f',
         aspect='auto',
-        height=600
+        height=400
     )
     fig.update_layout(
         xaxis_title='Category',
-        yaxis_title='College'
+        yaxis_title=group_col
     )
     
     return fig
 
-def create_sunburst_chart(data):
-    """Create sunburst chart"""
-    fig = px.sunburst(
-        data,
-        path=['Program', 'Specialty', 'College', 'Category'],
-        values='Seats',
-        title='Seat Allocation Hierarchy',
-        color='Category',
-        height=600
-    )
+def create_status_summary(data, group_col):
+    """Create status summary with counts"""
+    status_summary = data.groupby([group_col, 'Status']).size().reset_index(name='Count')
+    status_pivot = status_summary.pivot(index=group_col, columns='Status', values='Count').fillna(0)
     
-    return fig
+    # Add total
+    status_pivot['Total'] = status_pivot.sum(axis=1)
+    status_pivot['Pass_Rate'] = (status_pivot.get('✅', 0) / status_pivot['Total'] * 100).round(1)
+    
+    return status_pivot
+
+def create_issue_report(data, group_col, threshold=2):
+    """Create report of issues where percentage difference exceeds threshold"""
+    issues = data[abs(data['Percent_Difference']) > threshold].copy()
+    issues = issues.sort_values('Percent_Difference', ascending=False)
+    
+    if not issues.empty:
+        issues['Issue_Type'] = issues['Percent_Difference'].apply(
+            lambda x: 'Over-allocated' if x > 0 else 'Under-allocated'
+        )
+        issues['Severity'] = issues['Percent_Difference'].apply(
+            lambda x: 'High' if abs(x) > 5 else 'Medium' if abs(x) > 3 else 'Low'
+        )
+    
+    return issues
 
 # ============================================================================
 # MAIN APP
 # ============================================================================
 
 def main():
+    st.title("📊 Seat Allocation Percentage Analysis")
+    st.markdown("### Validate percentage distribution against expected seat matrix")
+    st.divider()
+    
     # Initialize session state
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
     if 'data' not in st.session_state:
         st.session_state.data = None
-    if 'processed' not in st.session_state:
-        st.session_state.processed = None
-    
-    st.title("🎓 Seat Allocation System")
-    st.markdown("### View and Analyze Seat Allocation Data")
-    st.divider()
     
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuration")
         
-        # Data input
         st.subheader("📁 Data Input")
         input_type = st.radio(
             "Choose input method:",
@@ -789,7 +266,7 @@ def main():
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
         
-        else:  # Paste Data
+        else:
             st.info("📝 Paste your CSV data below")
             text_data = st.text_area("CSV Data", height=200)
             if text_data:
@@ -802,316 +279,414 @@ def main():
         if data is not None:
             st.session_state.data = data
             
-            # Process data
-            if st.button("📊 Process Data", type="primary", use_container_width=True):
-                with st.spinner("Processing data..."):
-                    processed = process_allocated_data(data)
-                    st.session_state.processed = processed
-                    st.success("✅ Data processed successfully!")
+            if st.button("🔍 Analyze Percentages", type="primary", use_container_width=True):
+                with st.spinner("Analyzing percentage distribution..."):
+                    results = analyze_percentage_breakup(data)
+                    st.session_state.analysis_results = results
+                    st.success("✅ Analysis complete!")
                     st.balloons()
+        
+        # Show expected percentages
+        with st.expander("📊 Expected Percentages"):
+            expected_df = pd.DataFrame({
+                'Category': list(EXPECTED_PERCENTAGES.keys()),
+                'Expected_Seats': list(SEAT_MATRIX.values()),
+                'Expected_Percent': list(EXPECTED_PERCENTAGES.values())
+            })
+            st.dataframe(expected_df, use_container_width=True)
     
     # Main content
-    if st.session_state.processed is not None:
-        processed = st.session_state.processed
-        data = st.session_state.data
+    if st.session_state.analysis_results is not None:
+        results = st.session_state.analysis_results
         
-        # Metrics
-        col1, col2, col3, col4, col5 = st.columns(5)
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Seats", processed['total_seats'])
+            st.metric("Total Seats", results['total_seats'])
         with col2:
-            st.metric("Categories", processed['total_categories'])
+            total_programs = len(results['program_totals'])
+            st.metric("Programs", total_programs)
         with col3:
-            st.metric("Colleges", processed['total_colleges'])
+            total_specialties = len(results['specialty_totals'])
+            st.metric("Specialties", total_specialties)
         with col4:
-            st.metric("Specialties", processed['total_specialties'])
-        with col5:
-            expected_total = sum(SEAT_MATRIX.values())
-            diff = processed['total_seats'] - expected_total
-            st.metric(
-                "vs Expected", 
-                f"{processed['total_seats'] - expected_total:+d}",
-                delta_color="inverse"
-            )
-        
-        # Validation
-        validation_df = validate_allocations(data)
+            # Calculate overall pass rate
+            program_status = results['program_category'].groupby('Program')['Within_Tolerance'].all()
+            pass_rate = (program_status.sum() / len(program_status) * 100) if len(program_status) > 0 else 0
+            st.metric("Program Pass Rate", f"{pass_rate:.1f}%")
         
         # Tabs
         tabs = st.tabs([
-            "📊 Summary",
-            "📈 Category Analysis",
-            "🏛️ College Analysis",
-            "📚 Specialty Analysis",
-            "🔍 Detailed View",
-            "📋 Validation",
-            "📥 Download"
+            "📊 Overall Analysis",
+            "📈 Program Level",
+            "🏛️ Specialty Level",
+            "⚠️ Issues Report",
+            "📋 Detailed Data"
         ])
         
-        # Tab 1: Summary
+        # Tab 1: Overall Analysis
         with tabs[0]:
-            st.subheader("Summary Statistics")
+            st.subheader("Overall Category Distribution")
             
-            col1, col2 = st.columns(2)
+            # Overall category summary
+            overall = results['overall_category']
             
+            # Metrics
+            col1, col2, col3 = st.columns(3)
             with col1:
-                st.markdown("#### Category Summary")
-                st.dataframe(processed['category_summary'], use_container_width=True)
-                
-                st.markdown("#### Program Summary")
-                st.dataframe(processed['program_summary'], use_container_width=True)
-            
+                total_expected = sum(SEAT_MATRIX.values())
+                diff = results['total_seats'] - total_expected
+                st.metric("Total vs Expected", f"{diff:+d}", delta_color="inverse")
             with col2:
-                st.markdown("#### Top 10 Colleges")
-                st.dataframe(processed['college_summary'].head(10), use_container_width=True)
-                
-                st.markdown("#### Top 10 Specialties")
-                st.dataframe(processed['specialty_summary'].head(10), use_container_width=True)
-        
-        # Tab 2: Category Analysis
-        with tabs[1]:
-            st.subheader("Category-wise Analysis")
+                passing = overall[overall['Status'] == '✅'].shape[0]
+                st.metric("Categories Passing", f"{passing}/{len(overall)}")
+            with col3:
+                avg_deviation = overall['Percent_Difference'].abs().mean()
+                st.metric("Avg Deviation", f"{avg_deviation:.2f}%")
             
-            # Category chart
-            fig = create_category_chart(processed['category_summary'])
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Category breakdown table
-            st.markdown("#### Detailed Category Breakdown")
-            
-            # Pivot table for categories
-            cat_pivot = data.pivot_table(
-                index='Category',
-                columns='Specialty',
-                values='Seats',
-                fill_value=0,
-                aggfunc='sum'
-            )
-            st.dataframe(cat_pivot, use_container_width=True)
-        
-        # Tab 3: College Analysis
-        with tabs[2]:
-            st.subheader("College-wise Analysis")
-            
-            # College chart
-            fig = create_college_chart(processed['college_summary'])
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # College-Category breakdown
-            st.markdown("#### College-Category Breakdown")
-            college_cat = data.pivot_table(
-                index='College',
-                columns='Category',
-                values='Seats',
-                fill_value=0,
-                aggfunc='sum'
-            )
-            st.dataframe(college_cat, use_container_width=True)
-            
-            # College-Specialty breakdown
-            st.markdown("#### College-Specialty Breakdown")
-            college_spec = data.pivot_table(
-                index='College',
-                columns='Specialty',
-                values='Seats',
-                fill_value=0,
-                aggfunc='sum'
-            )
-            st.dataframe(college_spec, use_container_width=True)
-        
-        # Tab 4: Specialty Analysis
-        with tabs[3]:
-            st.subheader("Specialty-wise Analysis")
-            
-            # Specialty chart
-            fig = create_specialty_chart(processed['specialty_summary'])
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Specialty-Category breakdown
-            st.markdown("#### Specialty-Category Breakdown")
-            spec_cat = data.pivot_table(
-                index='Specialty',
-                columns='Category',
-                values='Seats',
-                fill_value=0,
-                aggfunc='sum'
-            )
-            st.dataframe(spec_cat, use_container_width=True)
-        
-        # Tab 5: Detailed View
-        with tabs[4]:
-            st.subheader("Detailed Data View")
-            
-            # Heatmap
-            st.markdown("#### Allocation Heatmap")
-            fig = create_heatmap(data)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Sunburst
-            st.markdown("#### Hierarchical View")
-            fig = create_sunburst_chart(data)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # All data
-            st.markdown("#### All Data")
-            st.dataframe(data, use_container_width=True)
-        
-        # Tab 6: Validation
-        with tabs[5]:
-            st.subheader("Data Validation")
-            
-            st.markdown("""
-            This section validates the allocation against the expected seat matrix:
-            - **SM**: 50 seats
-            - **EW**: 10 seats
-            - **EZ**: 9 seats
-            - **MU**: 8 seats
-            - **SC**: 8 seats
-            - **BH**: 3 seats
-            - **LA**: 3 seats
-            - **DV**: 2 seats
-            - **VK**: 2 seats
-            - **ST**: 2 seats
-            - **KN**: 1 seat
-            - **BX**: 1 seat
-            - **KU**: 1 seat
-            """)
-            
-            # Display validation results
+            # Display overall summary
             st.dataframe(
-                validation_df,
+                overall,
                 column_config={
                     'Category': 'Category',
-                    'Expected': st.column_config.NumberColumn('Expected', format='%d'),
-                    'Actual': st.column_config.NumberColumn('Actual', format='%d'),
-                    'Difference': st.column_config.NumberColumn('Difference', format='%d'),
+                    'Seats': st.column_config.NumberColumn('Actual Seats', format='%d'),
+                    'Expected': st.column_config.NumberColumn('Expected Seats', format='%d'),
+                    'Difference': st.column_config.NumberColumn('Seats Diff', format='%d'),
+                    'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
+                    'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
+                    'Percent_Difference': st.column_config.NumberColumn('Deviation %', format='%.2f%%'),
                     'Status': 'Status'
                 },
                 use_container_width=True
             )
             
-            # Show validation summary
-            all_match = (validation_df['Difference'] == 0).all()
+            # Category chart
+            fig = go.Figure()
             
-            if all_match:
-                st.success("✅ All allocations match the expected seat matrix exactly!")
-            else:
-                st.warning("⚠️ Some allocations differ from the expected seat matrix")
-                
-                # Show mismatches
-                mismatches = validation_df[validation_df['Difference'] != 0]
-                if not mismatches.empty:
-                    st.markdown("#### Mismatches found:")
-                    st.dataframe(
-                        mismatches[['Category', 'Expected', 'Actual', 'Difference']],
-                        use_container_width=True
-                    )
+            fig.add_trace(go.Bar(
+                x=overall['Category'],
+                y=overall['Actual_Percent'],
+                name='Actual',
+                marker_color='#2ca02c',
+                text=overall['Actual_Percent'].apply(lambda x: f'{x:.1f}%'),
+                textposition='outside'
+            ))
+            
+            fig.add_trace(go.Bar(
+                x=overall['Category'],
+                y=overall['Expected_Percent'],
+                name='Expected',
+                marker_color='#1f77b4',
+                text=overall['Expected_Percent'].apply(lambda x: f'{x:.1f}%'),
+                textposition='outside'
+            ))
+            
+            fig.update_layout(
+                title='Overall Category Distribution - Actual vs Expected',
+                xaxis_title='Category',
+                yaxis_title='Percentage (%)',
+                barmode='group',
+                height=400
+            )
+            st.plotly_chart(fig, use_container_width=True)
         
-        # Tab 7: Download - FIXED JSON SERIALIZATION
-        with tabs[6]:
-            st.subheader("📥 Download Results")
+        # Tab 2: Program Level
+        with tabs[1]:
+            st.subheader("Program Level Percentage Analysis")
+            
+            # Program selector
+            programs = results['program_totals']['Program'].tolist()
+            selected_program = st.selectbox("Select Program", programs)
+            
+            # Filter data for selected program
+            program_data = results['program_category'][results['program_category']['Program'] == selected_program]
+            
+            if not program_data.empty:
+                # Show program summary
+                prog_total = results['program_totals'][results['program_totals']['Program'] == selected_program]['Program_Total'].values[0]
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Seats", prog_total)
+                with col2:
+                    passing = program_data[program_data['Within_Tolerance']].shape[0]
+                    st.metric("Categories Passing", f"{passing}/{len(program_data)}")
+                with col3:
+                    avg_dev = program_data['Percent_Difference'].abs().mean()
+                    st.metric("Avg Deviation", f"{avg_dev:.2f}%")
+                
+                # Display program data
+                st.dataframe(
+                    program_data[['Category', 'Seats', 'Expected_Seats', 'Seats_Difference', 
+                                  'Actual_Percent', 'Expected_Percent', 'Percent_Difference', 'Status']],
+                    column_config={
+                        'Category': 'Category',
+                        'Seats': st.column_config.NumberColumn('Actual Seats', format='%d'),
+                        'Expected_Seats': st.column_config.NumberColumn('Expected Seats', format='%d'),
+                        'Seats_Difference': st.column_config.NumberColumn('Seats Diff', format='%d'),
+                        'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
+                        'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
+                        'Percent_Difference': st.column_config.NumberColumn('Deviation %', format='%.2f%%'),
+                        'Status': 'Status'
+                    },
+                    use_container_width=True
+                )
+                
+                # Chart for selected program
+                fig = create_percentage_comparison_chart(program_data, 'Category')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # All programs summary
+            st.markdown("#### All Programs Summary")
+            program_status_summary = create_status_summary(results['program_category'], 'Program')
+            st.dataframe(program_status_summary, use_container_width=True)
+            
+            # Program heatmap
+            fig = create_percentage_deviation_chart(results['program_category'], 'Program')
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Tab 3: Specialty Level
+        with tabs[2]:
+            st.subheader("Specialty Level Percentage Analysis")
+            
+            # Specialty selector
+            specialties = results['specialty_totals']['Specialty'].tolist()
+            selected_specialty = st.selectbox("Select Specialty", specialties)
+            
+            # Filter data for selected specialty
+            specialty_data = results['specialty_category'][results['specialty_category']['Specialty'] == selected_specialty]
+            
+            if not specialty_data.empty:
+                spec_total = results['specialty_totals'][results['specialty_totals']['Specialty'] == selected_specialty]['Specialty_Total'].values[0]
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Seats", spec_total)
+                with col2:
+                    passing = specialty_data[specialty_data['Within_Tolerance']].shape[0]
+                    st.metric("Categories Passing", f"{passing}/{len(specialty_data)}")
+                with col3:
+                    avg_dev = specialty_data['Percent_Difference'].abs().mean()
+                    st.metric("Avg Deviation", f"{avg_dev:.2f}%")
+                
+                st.dataframe(
+                    specialty_data[['Category', 'Seats', 'Expected_Seats', 'Seats_Difference',
+                                  'Actual_Percent', 'Expected_Percent', 'Percent_Difference', 'Status']],
+                    column_config={
+                        'Category': 'Category',
+                        'Seats': st.column_config.NumberColumn('Actual Seats', format='%d'),
+                        'Expected_Seats': st.column_config.NumberColumn('Expected Seats', format='%d'),
+                        'Seats_Difference': st.column_config.NumberColumn('Seats Diff', format='%d'),
+                        'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
+                        'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
+                        'Percent_Difference': st.column_config.NumberColumn('Deviation %', format='%.2f%%'),
+                        'Status': 'Status'
+                    },
+                    use_container_width=True
+                )
+                
+                fig = create_percentage_comparison_chart(specialty_data, 'Category')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # All specialties summary
+            st.markdown("#### All Specialties Summary")
+            specialty_status_summary = create_status_summary(results['specialty_category'], 'Specialty')
+            st.dataframe(specialty_status_summary, use_container_width=True)
+            
+            # Specialty heatmap
+            fig = create_percentage_deviation_chart(results['specialty_category'], 'Specialty')
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Tab 4: Issues Report
+        with tabs[3]:
+            st.subheader("⚠️ Issues Report")
+            st.markdown("Categories where percentage deviation exceeds 2%")
+            
+            # Program level issues
+            st.markdown("#### Program Level Issues")
+            program_issues = create_issue_report(results['program_category'], 'Program')
+            
+            if not program_issues.empty:
+                st.dataframe(
+                    program_issues[['Program', 'Category', 'Seats', 'Expected_Seats', 
+                                   'Actual_Percent', 'Expected_Percent', 'Percent_Difference', 
+                                   'Issue_Type', 'Severity']],
+                    column_config={
+                        'Program': 'Program',
+                        'Category': 'Category',
+                        'Seats': st.column_config.NumberColumn('Actual', format='%d'),
+                        'Expected_Seats': st.column_config.NumberColumn('Expected', format='%d'),
+                        'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
+                        'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
+                        'Percent_Difference': st.column_config.NumberColumn('Deviation', format='%.2f%%'),
+                        'Issue_Type': 'Issue',
+                        'Severity': 'Severity'
+                    },
+                    use_container_width=True
+                )
+                
+                # Color-coded issues by severity
+                severity_colors = {'High': '#ff4444', 'Medium': '#ffaa00', 'Low': '#ffdd00'}
+                
+                fig = go.Figure()
+                for severity, color in severity_colors.items():
+                    severity_data = program_issues[program_issues['Severity'] == severity]
+                    if not severity_data.empty:
+                        fig.add_trace(go.Bar(
+                            x=severity_data['Category'],
+                            y=severity_data['Percent_Difference'],
+                            name=severity,
+                            marker_color=color,
+                            text=severity_data['Program'] + ' (' + severity_data['Percent_Difference'].apply(lambda x: f'{x:.1f}%') + ')',
+                            textposition='outside'
+                        ))
+                
+                fig.update_layout(
+                    title='Program Level Issues by Severity',
+                    xaxis_title='Category',
+                    yaxis_title='Percentage Deviation (%)',
+                    barmode='group',
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.success("✅ No issues found at program level!")
+            
+            # Specialty level issues
+            st.markdown("#### Specialty Level Issues")
+            specialty_issues = create_issue_report(results['specialty_category'], 'Specialty')
+            
+            if not specialty_issues.empty:
+                st.dataframe(
+                    specialty_issues[['Specialty', 'Category', 'Seats', 'Expected_Seats',
+                                    'Actual_Percent', 'Expected_Percent', 'Percent_Difference',
+                                    'Issue_Type', 'Severity']],
+                    column_config={
+                        'Specialty': 'Specialty',
+                        'Category': 'Category',
+                        'Seats': st.column_config.NumberColumn('Actual', format='%d'),
+                        'Expected_Seats': st.column_config.NumberColumn('Expected', format='%d'),
+                        'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
+                        'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
+                        'Percent_Difference': st.column_config.NumberColumn('Deviation', format='%.2f%%'),
+                        'Issue_Type': 'Issue',
+                        'Severity': 'Severity'
+                    },
+                    use_container_width=True
+                )
+            else:
+                st.success("✅ No issues found at specialty level!")
+        
+        # Tab 5: Detailed Data
+        with tabs[4]:
+            st.subheader("📋 Detailed Data")
+            
+            # Full data view
+            st.markdown("#### All Data")
+            st.dataframe(st.session_state.data, use_container_width=True)
+            
+            # Download options
+            st.markdown("#### Download Analysis")
             
             col1, col2 = st.columns(2)
             
             with col1:
-                # Download CSV
-                csv = data.to_csv(index=False)
+                # Program level analysis download
+                csv_program = results['program_category'].to_csv(index=False)
                 st.download_button(
-                    "📥 Download Full Data as CSV",
-                    csv,
-                    f"seat_allocation_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "📥 Download Program Level Analysis",
+                    csv_program,
+                    f"program_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     "text/csv",
                     use_container_width=True
                 )
             
             with col2:
-                # Download JSON - Fixed to handle numpy types
-                json_data = {
-                    'timestamp': datetime.now().isoformat(),
-                    'seat_matrix': SEAT_MATRIX,
-                    'total_seats': int(processed['total_seats']),
-                    'summary': {
-                        'category_summary': processed['category_summary'].to_dict('records'),
-                        'college_summary': processed['college_summary'].to_dict('records'),
-                        'specialty_summary': processed['specialty_summary'].to_dict('records')
-                    },
-                    'data': data.to_dict('records')
-                }
-                
-                # Convert any numpy types to Python native types
-                def convert_to_serializable(obj):
-                    if isinstance(obj, np.integer):
-                        return int(obj)
-                    elif isinstance(obj, np.floating):
-                        return float(obj)
-                    elif isinstance(obj, np.ndarray):
-                        return obj.tolist()
-                    elif isinstance(obj, dict):
-                        return {k: convert_to_serializable(v) for k, v in obj.items()}
-                    elif isinstance(obj, list):
-                        return [convert_to_serializable(item) for item in obj]
-                    else:
-                        return obj
-                
-                json_data = convert_to_serializable(json_data)
-                json_str = json.dumps(json_data, indent=2)
-                
+                # Specialty level analysis download
+                csv_specialty = results['specialty_category'].to_csv(index=False)
                 st.download_button(
-                    "📥 Download as JSON",
-                    json_str,
-                    f"seat_allocation_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    "application/json",
+                    "📥 Download Specialty Level Analysis",
+                    csv_specialty,
+                    f"specialty_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "text/csv",
                     use_container_width=True
                 )
-            
-            # Download validation report
-            st.markdown("#### Download Validation Report")
-            validation_csv = validation_df.to_csv(index=False)
-            st.download_button(
-                "📥 Download Validation Report",
-                validation_csv,
-                f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv",
-                use_container_width=True
-            )
     
     else:
         # Welcome message
-        st.info("👈 Load your data in the sidebar and click 'Process Data'")
+        st.info("👈 Upload your data in the sidebar and click 'Analyze Percentages'")
         
         st.markdown("""
-        ### 📋 How to Use This Application
+        ### 📊 What This Tool Does
         
-        1. **Load Data**: Upload a CSV file or use sample data
-        2. **Process**: Click 'Process Data' to analyze
-        3. **Explore**: View results across multiple tabs
-        4. **Export**: Download results in CSV or JSON format
+        This tool analyzes seat allocation percentages to ensure they match the expected distribution:
         
-        ### 📁 Required Data Format
+        #### 🎯 Expected Distribution (Total 100 seats)
+        - **SM**: 50% (50 seats)
+        - **EW**: 10% (10 seats)
+        - **EZ**: 9% (9 seats)
+        - **MU**: 8% (8 seats)
+        - **SC**: 8% (8 seats)
+        - **BH**: 3% (3 seats)
+        - **LA**: 3% (3 seats)
+        - **DV**: 2% (2 seats)
+        - **VK**: 2% (2 seats)
+        - **ST**: 2% (2 seats)
+        - **KN**: 1% (1 seat)
+        - **BX**: 1% (1 seat)
+        - **KU**: 1% (1 seat)
+        
+        #### 📋 What It Checks
+        
+        1. **Program Level**: For each program (CS, EC, EE, etc.), checks if the percentage distribution matches the expected percentages
+        2. **Specialty Level**: For each specialty, checks if the percentage distribution matches the expected percentages
+        3. **Identifies Issues**: Flags categories where percentage deviation exceeds 2%
+        
+        #### 📁 Required Data Format
         
         Your CSV should have these columns:
-        - **Program**: Program code (e.g., E)
+        - **Program**: Program code (CS, EC, ME, etc.)
         - **Specialty**: Specialty name
         - **College**: College name
-        - **Type**: Type (e.g., G)
+        - **Type**: Type (G, etc.)
         - **Category**: Seat category (SM, EW, EZ, etc.)
         - **Seats**: Number of seats
+        """)
         
-        ### 🎯 Expected Seat Matrix
+        # Show example of what the analysis reveals
+        st.markdown("### 🔍 Example Issues Detected")
         
-        - **SM**: 50 seats
-        - **EW**: 10 seats
-        - **EZ**: 9 seats
-        - **MU**: 8 seats
-        - **SC**: 8 seats
-        - **BH**: 3 seats
-        - **LA**: 3 seats
-        - **DV**: 2 seats
-        - **VK**: 2 seats
-        - **ST**: 2 seats
-        - **KN**: 1 seat
-        - **BX**: 1 seat
-        - **KU**: 1 seat
+        example_data = pd.DataFrame({
+            'Program': ['CS', 'CS', 'CS', 'CS', 'CS', 'CS', 'CS'],
+            'Category': ['SM', 'EW', 'EZ', 'MU', 'SC', 'BH', 'ST'],
+            'Actual_Seats': [80, 23, 21, 15, 14, 1, 2],
+            'Expected_Seats': [80, 16, 14.4, 12.8, 12.8, 4.8, 3.2],
+            'Actual_Percent': [50.0, 14.4, 13.1, 9.4, 8.8, 0.6, 1.3],
+            'Expected_Percent': [50.0, 10.0, 9.0, 8.0, 8.0, 3.0, 2.0],
+            'Deviation': [0.0, 4.4, 4.1, 1.4, 0.8, -2.4, -0.7],
+            'Status': ['✅', '⚠️', '⚠️', '✅', '✅', '⚠️', '✅']
+        })
+        
+        st.dataframe(
+            example_data,
+            column_config={
+                'Program': 'Program',
+                'Category': 'Category',
+                'Actual_Seats': st.column_config.NumberColumn('Actual Seats', format='%d'),
+                'Expected_Seats': st.column_config.NumberColumn('Expected Seats', format='%.1f'),
+                'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.1f%%'),
+                'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.1f%%'),
+                'Deviation': st.column_config.NumberColumn('Deviation', format='%.1f%%'),
+                'Status': 'Status'
+            },
+            use_container_width=True
+        )
+        
+        st.warning("""
+        ⚠️ **Issues Found:**
+        - **EW**: 23 seats (14.4%) vs expected 10% (+4.4% deviation) - **Over-allocated**
+        - **EZ**: 21 seats (13.1%) vs expected 9% (+4.1% deviation) - **Over-allocated**
+        - **BH**: 1 seat (0.6%) vs expected 3% (-2.4% deviation) - **Under-allocated**
         """)
 
 # ============================================================================
