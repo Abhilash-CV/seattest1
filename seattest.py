@@ -4,14 +4,15 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from io import StringIO
+from datetime import datetime
 
 # ============================================================================
 # PAGE CONFIGURATION
 # ============================================================================
 
 st.set_page_config(
-    page_title="Seat Allocation Percentage Analysis",
-    page_icon="📊",
+    page_title="Seat Allocation Adjuster",
+    page_icon="🎯",
     layout="wide"
 )
 
@@ -33,97 +34,246 @@ EXPECTED_PERCENTAGES = {
 }
 
 # ============================================================================
-# DATA PROCESSING
+# SEAT ADJUSTMENT FUNCTIONS
 # ============================================================================
 
-def analyze_percentage_breakup(data):
+def adjust_seats_by_percentage(data, program_col='Program', tolerance=2):
     """
-    Analyze percentage breakup for each category within each program/specialty
+    Adjust seat allocation to match expected percentages
     """
-    total_seats = data['Seats'].sum()
+    # Create a copy
+    adjusted_data = data.copy()
     
-    # Group by Program and Category to get distribution
-    program_category = data.groupby(['Program', 'Category'])['Seats'].sum().reset_index()
+    # Get unique programs
+    programs = adjusted_data[program_col].unique()
     
-    # Get total per program
-    program_totals = data.groupby('Program')['Seats'].sum().reset_index()
-    program_totals.columns = ['Program', 'Program_Total']
+    # Store adjustment details
+    adjustment_log = []
     
-    # Merge to get percentages
-    program_category = program_category.merge(program_totals, on='Program')
-    program_category['Actual_Percent'] = (program_category['Seats'] / program_category['Program_Total'] * 100).round(2)
+    for program in programs:
+        # Get program total
+        program_data = adjusted_data[adjusted_data[program_col] == program]
+        program_total = program_data['Seats'].sum()
+        
+        if program_total == 0:
+            continue
+        
+        # Calculate expected seats for each category in this program
+        for category, expected_pct in EXPECTED_PERCENTAGES.items():
+            expected_seats = (program_total * expected_pct / 100)
+            
+            # Get current seats for this category in this program
+            current_mask = (adjusted_data[program_col] == program) & (adjusted_data['Category'] == category)
+            current_seats = adjusted_data.loc[current_mask, 'Seats'].sum()
+            
+            # Calculate difference
+            diff = expected_seats - current_seats
+            
+            # Log the adjustment needed
+            if abs(diff) > 0.5:  # Only log significant differences
+                adjustment_log.append({
+                    program_col: program,
+                    'Category': category,
+                    'Current_Seats': int(current_seats),
+                    'Expected_Seats': round(expected_seats, 1),
+                    'Diff': round(diff, 1),
+                    'Program_Total': program_total
+                })
+            
+            # Adjust the seats if within tolerance
+            if abs(diff) > tolerance * program_total / 100:
+                # Find a row to adjust
+                if current_seats > 0 and diff < 0:  # Need to reduce
+                    # Find rows with this category and reduce
+                    rows_to_reduce = adjusted_data[(adjusted_data[program_col] == program) & 
+                                                   (adjusted_data['Category'] == category)]
+                    for idx in rows_to_reduce.index:
+                        if adjusted_data.loc[idx, 'Seats'] > 1:
+                            adjusted_data.loc[idx, 'Seats'] -= 1
+                            break
     
-    # Add expected percentage
-    program_category['Expected_Percent'] = program_category['Category'].map(EXPECTED_PERCENTAGES).round(2)
-    program_category['Percent_Difference'] = (program_category['Actual_Percent'] - program_category['Expected_Percent']).round(2)
+    # Recalculate totals after adjustments
+    # Ensure total per program remains same
+    for program in programs:
+        program_mask = adjusted_data[program_col] == program
+        new_total = adjusted_data.loc[program_mask, 'Seats'].sum()
+        original_total = data[data[program_col] == program]['Seats'].sum()
+        
+        if new_total != original_total:
+            # Find SM category (or any category with seats) to adjust
+            sm_rows = adjusted_data[(adjusted_data[program_col] == program) & 
+                                    (adjusted_data['Category'] == 'SM')]
+            if not sm_rows.empty:
+                idx = sm_rows.index[0]
+                adjusted_data.loc[idx, 'Seats'] += (original_total - new_total)
     
-    # Add expected seats
-    program_category['Expected_Seats'] = (program_category['Program_Total'] * program_category['Expected_Percent'] / 100).round(0).astype(int)
-    program_category['Seats_Difference'] = program_category['Seats'] - program_category['Expected_Seats']
+    return adjusted_data, pd.DataFrame(adjustment_log)
+
+def smart_adjust_seats(data, program_col='Program'):
+    """
+    Smart adjustment using iterative proportional fitting
+    """
+    adjusted_data = data.copy()
+    programs = adjusted_data[program_col].unique()
     
-    # Flag if percentage is within tolerance (±2%)
-    program_category['Within_Tolerance'] = abs(program_category['Percent_Difference']) <= 2
-    program_category['Status'] = program_category['Within_Tolerance'].map({True: '✅', False: '⚠️'})
+    adjustment_history = []
     
-    # Similar analysis by Specialty
-    specialty_category = data.groupby(['Specialty', 'Category'])['Seats'].sum().reset_index()
-    specialty_totals = data.groupby('Specialty')['Seats'].sum().reset_index()
-    specialty_totals.columns = ['Specialty', 'Specialty_Total']
-    specialty_category = specialty_category.merge(specialty_totals, on='Specialty')
-    specialty_category['Actual_Percent'] = (specialty_category['Seats'] / specialty_category['Specialty_Total'] * 100).round(2)
-    specialty_category['Expected_Percent'] = specialty_category['Category'].map(EXPECTED_PERCENTAGES).round(2)
-    specialty_category['Percent_Difference'] = (specialty_category['Actual_Percent'] - specialty_category['Expected_Percent']).round(2)
-    specialty_category['Expected_Seats'] = (specialty_category['Specialty_Total'] * specialty_category['Expected_Percent'] / 100).round(0).astype(int)
-    specialty_category['Seats_Difference'] = specialty_category['Seats'] - specialty_category['Expected_Seats']
-    specialty_category['Within_Tolerance'] = abs(specialty_category['Percent_Difference']) <= 2
-    specialty_category['Status'] = specialty_category['Within_Tolerance'].map({True: '✅', False: '⚠️'})
+    for program in programs:
+        program_mask = adjusted_data[program_col] == program
+        program_total = adjusted_data.loc[program_mask, 'Seats'].sum()
+        
+        if program_total == 0:
+            continue
+        
+        # Get current distribution
+        current_dist = adjusted_data[program_mask].groupby('Category')['Seats'].sum()
+        
+        # Calculate target distribution
+        target_seats = {}
+        for cat, pct in EXPECTED_PERCENTAGES.items():
+            target_seats[cat] = program_total * pct / 100
+        
+        # Iterative adjustment
+        max_iterations = 100
+        for _ in range(max_iterations):
+            # Calculate current percentages
+            current_pct = current_dist / program_total * 100
+            
+            # Find categories that need adjustment
+            adjustments = {}
+            for cat in EXPECTED_PERCENTAGES.keys():
+                current = current_pct.get(cat, 0)
+                expected = EXPECTED_PERCENTAGES[cat]
+                diff = expected - current
+                
+                if abs(diff) > 1.0:  # Need adjustment if >1% difference
+                    adjustments[cat] = diff
+            
+            if not adjustments:
+                break
+            
+            # Apply adjustments
+            for cat, diff in adjustments.items():
+                if diff > 0:  # Need to add seats to this category
+                    # Find categories with surplus to take from
+                    surplus_cats = [c for c, d in adjustments.items() if d < 0]
+                    if surplus_cats:
+                        # Take from the category with largest surplus
+                        take_from = min(surplus_cats, key=lambda c: adjustments[c])
+                        
+                        # Find rows to adjust
+                        add_rows = adjusted_data[(adjusted_data[program_col] == program) & 
+                                                (adjusted_data['Category'] == cat)]
+                        remove_rows = adjusted_data[(adjusted_data[program_col] == program) & 
+                                                   (adjusted_data['Category'] == take_from)]
+                        
+                        if not add_rows.empty and not remove_rows.empty:
+                            # Add one seat
+                            idx_add = add_rows.index[0]
+                            adjusted_data.loc[idx_add, 'Seats'] += 1
+                            
+                            # Remove one seat
+                            idx_remove = remove_rows.index[0]
+                            if adjusted_data.loc[idx_remove, 'Seats'] > 1:
+                                adjusted_data.loc[idx_remove, 'Seats'] -= 1
+                            else:
+                                # If only 1 seat, find another category
+                                for other_cat in surplus_cats:
+                                    other_rows = adjusted_data[(adjusted_data[program_col] == program) & 
+                                                              (adjusted_data['Category'] == other_cat)]
+                                    if not other_rows.empty:
+                                        idx_remove = other_rows.index[0]
+                                        if adjusted_data.loc[idx_remove, 'Seats'] > 1:
+                                            adjusted_data.loc[idx_remove, 'Seats'] -= 1
+                                            break
+                            
+                            # Update current distribution
+                            current_dist = adjusted_data[program_mask].groupby('Category')['Seats'].sum()
+                            
+                            # Log adjustment
+                            adjustment_history.append({
+                                program_col: program,
+                                'Action': f'Move 1 seat from {take_from} to {cat}',
+                                'New_Seats': int(adjusted_data.loc[program_mask, 'Seats'].sum())
+                            })
     
-    # Overall category summary
-    overall_category = data.groupby('Category')['Seats'].sum().reset_index()
-    overall_category['Expected'] = overall_category['Category'].map(SEAT_MATRIX)
-    overall_category['Difference'] = overall_category['Seats'] - overall_category['Expected']
-    overall_category['Actual_Percent'] = (overall_category['Seats'] / total_seats * 100).round(2)
-    overall_category['Expected_Percent'] = overall_category['Category'].map(EXPECTED_PERCENTAGES).round(2)
-    overall_category['Percent_Difference'] = (overall_category['Actual_Percent'] - overall_category['Expected_Percent']).round(2)
-    overall_category['Status'] = overall_category.apply(
-        lambda row: '✅' if abs(row['Percent_Difference']) <= 2 else '⚠️', 
-        axis=1
-    )
-    
-    return {
-        'program_category': program_category,
-        'specialty_category': specialty_category,
-        'overall_category': overall_category,
-        'program_totals': program_totals,
-        'specialty_totals': specialty_totals,
-        'total_seats': total_seats
-    }
+    return adjusted_data, pd.DataFrame(adjustment_history)
 
 def get_sample_data():
-    """Create sample data with your structure"""
+    """Create sample data with the CS example showing issues"""
     data = """Program,Specialty,College,Type,Category,Seats
-CS,IDK,some_college,G,SM,2
-CS,IDK,some_college,G,EW,1
-CS,IDK,some_college,G,EZ,1
-CS,NSS,some_college,G,SM,3
-CS,NSS,some_college,G,EW,1
-CS,NSS,some_college,G,EZ,1
-CS,LBT,some_college,G,SM,4
-CS,LBT,some_college,G,EW,1
-CS,LBT,some_college,G,SC,1
-CS,LBT,some_college,G,EZ,1
-CS,LBT,some_college,G,MU,1
-CS,LBT,some_college,G,BH,1
-CS,MDL,some_college,G,SM,4
-CS,MDL,some_college,G,EW,1
-CS,MDL,some_college,G,SC,1
-CS,MDL,some_college,G,EZ,1
-CS,MDL,some_college,G,MU,1
-CS,CHN,some_college,G,SM,5
-CS,CHN,some_college,G,EW,1
-CS,CHN,some_college,G,SC,1
-CS,CHN,some_college,G,EZ,1
-CS,CHN,some_college,G,MU,1"""
+CS,IDK,COLLEGE,G,SM,2
+CS,IDK,COLLEGE,G,EW,1
+CS,IDK,COLLEGE,G,EZ,1
+CS,NSS,COLLEGE,G,SM,3
+CS,NSS,COLLEGE,G,EW,1
+CS,NSS,COLLEGE,G,EZ,1
+CS,LBT,COLLEGE,G,SM,4
+CS,LBT,COLLEGE,G,EW,1
+CS,LBT,COLLEGE,G,SC,1
+CS,LBT,COLLEGE,G,EZ,1
+CS,LBT,COLLEGE,G,MU,1
+CS,LBT,COLLEGE,G,BH,1
+CS,MDL,COLLEGE,G,SM,4
+CS,MDL,COLLEGE,G,EW,1
+CS,MDL,COLLEGE,G,SC,1
+CS,MDL,COLLEGE,G,EZ,1
+CS,MDL,COLLEGE,G,MU,1
+CS,CHN,COLLEGE,G,SM,5
+CS,CHN,COLLEGE,G,EW,1
+CS,CHN,COLLEGE,G,SC,1
+CS,CHN,COLLEGE,G,EZ,1
+CS,CHN,COLLEGE,G,MU,1
+CS,KGR,COLLEGE,G,SM,3
+CS,KGR,COLLEGE,G,EW,1
+CS,KGR,COLLEGE,G,EZ,1
+CS,KGR,COLLEGE,G,MU,1
+CS,CEA,COLLEGE,G,SM,3
+CS,CEA,COLLEGE,G,EW,1
+CS,CEA,COLLEGE,G,SC,1
+CS,CEA,COLLEGE,G,EZ,1
+CS,CEA,COLLEGE,G,MU,1
+CS,CEC,COLLEGE,G,SM,3
+CS,CEC,COLLEGE,G,EW,1
+CS,CEC,COLLEGE,G,EZ,1
+CS,CEC,COLLEGE,G,MU,1
+CS,CEK,COLLEGE,G,SM,3
+CS,CEK,COLLEGE,G,EW,1
+CS,CEK,COLLEGE,G,EZ,1
+CS,CEK,COLLEGE,G,MU,1
+CS,CEM,COLLEGE,G,SM,3
+CS,CEM,COLLEGE,G,EW,1
+CS,CEM,COLLEGE,G,SC,1
+CS,CEM,COLLEGE,G,EZ,1
+CS,CHN2,COLLEGE,G,SM,5
+CS,CHN2,COLLEGE,G,EW,1
+CS,CHN2,COLLEGE,G,SC,1
+CS,CHN2,COLLEGE,G,EZ,1
+CS,CHN2,COLLEGE,G,MU,1
+CS,KGR2,COLLEGE,G,SM,3
+CS,KGR2,COLLEGE,G,EW,1
+CS,KGR2,COLLEGE,G,EZ,1
+CS,KGR2,COLLEGE,G,MU,1
+CS,KNP,COLLEGE,G,SM,3
+CS,KNP,COLLEGE,G,EW,1
+CS,KNP,COLLEGE,G,EZ,1
+CS,KNP,COLLEGE,G,MU,1
+CS,KSD,COLLEGE,G,SM,3
+CS,KSD,COLLEGE,G,EW,1
+CS,KSD,COLLEGE,G,SC,1
+CS,KSD,COLLEGE,G,EZ,1
+CS,KSD,COLLEGE,G,MU,1
+CS,LBT2,COLLEGE,G,SM,4
+CS,LBT2,COLLEGE,G,EW,1
+CS,LBT2,COLLEGE,G,SC,1
+CS,LBT2,COLLEGE,G,EZ,1
+CS,LBT2,COLLEGE,G,MU,1
+CS,LBT2,COLLEGE,G,BH,1
+CS,MDL2,COLLEGE,G,SM,4
+CS,MDL2,COLLEGE,G,EW,1
+CS,MDL2,COLLEGE,G,SC,1
+CS,MDL2,COLLEGE,G,EZ,1
+CS,MDL2,COLLEGE,G,MU,1"""
     
     df = pd.read_csv(StringIO(data))
     return df
@@ -132,112 +282,119 @@ CS,CHN,some_college,G,MU,1"""
 # VISUALIZATION FUNCTIONS
 # ============================================================================
 
-def create_percentage_comparison_chart(data, group_col):
-    """Create bar chart comparing actual vs expected percentages"""
+def compare_distribution(original_data, adjusted_data, program_col='Program', category='EW'):
+    """Compare original vs adjusted distribution for a specific category"""
+    
+    # Get original distribution
+    orig_dist = original_data[original_data['Category'] == category].groupby(program_col)['Seats'].sum()
+    adj_dist = adjusted_data[adjusted_data['Category'] == category].groupby(program_col)['Seats'].sum()
+    
+    # Combine
+    all_programs = sorted(set(orig_dist.index) | set(adj_dist.index))
+    orig_values = [orig_dist.get(p, 0) for p in all_programs]
+    adj_values = [adj_dist.get(p, 0) for p in all_programs]
+    
     fig = go.Figure()
-    
-    # Get unique categories
-    categories = data['Category'].unique()
-    
-    for cat in categories:
-        cat_data = data[data['Category'] == cat]
-        
-        fig.add_trace(go.Bar(
-            name=f'{cat} (Expected)',
-            x=cat_data[group_col],
-            y=cat_data['Expected_Percent'],
-            marker_color='lightgray',
-            opacity=0.5,
-            legendgroup=cat,
-            showlegend=True
-        ))
-        
-        fig.add_trace(go.Bar(
-            name=f'{cat} (Actual)',
-            x=cat_data[group_col],
-            y=cat_data['Actual_Percent'],
-            marker_color=px.colors.qualitative.Set3[list(categories).index(cat) % len(px.colors.qualitative.Set3)],
-            legendgroup=cat,
-            showlegend=True
-        ))
+    fig.add_trace(go.Bar(
+        x=all_programs,
+        y=orig_values,
+        name='Original',
+        marker_color='#ff7f0e'
+    ))
+    fig.add_trace(go.Bar(
+        x=all_programs,
+        y=adj_values,
+        name='Adjusted',
+        marker_color='#2ca02c'
+    ))
     
     fig.update_layout(
-        title='Actual vs Expected Percentage Distribution',
-        xaxis_title=group_col,
-        yaxis_title='Percentage (%)',
+        title=f'Seat Distribution for Category: {category}',
+        xaxis_title=program_col,
+        yaxis_title='Number of Seats',
         barmode='group',
-        height=500,
-        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
-    )
-    
-    return fig
-
-def create_percentage_deviation_chart(data, group_col):
-    """Create chart showing percentage deviations"""
-    # Pivot for heatmap
-    pivot_data = data.pivot_table(
-        index=group_col,
-        columns='Category',
-        values='Percent_Difference',
-        fill_value=0
-    )
-    
-    fig = px.imshow(
-        pivot_data,
-        title=f'Percentage Deviation from Expected ({group_col} level)',
-        color_continuous_scale='RdYlGn',
-        color_continuous_midpoint=0,
-        text_auto='.1f',
-        aspect='auto',
         height=400
     )
-    fig.update_layout(
-        xaxis_title='Category',
-        yaxis_title=group_col
-    )
     
     return fig
 
-def create_status_summary(data, group_col):
-    """Create status summary with counts"""
-    status_summary = data.groupby([group_col, 'Status']).size().reset_index(name='Count')
-    status_pivot = status_summary.pivot(index=group_col, columns='Status', values='Count').fillna(0)
+def create_summary_table(original_data, adjusted_data, program_col='Program'):
+    """Create summary table comparing original vs adjusted"""
+    summary = []
     
-    # Add total
-    status_pivot['Total'] = status_pivot.sum(axis=1)
-    status_pivot['Pass_Rate'] = (status_pivot.get('✅', 0) / status_pivot['Total'] * 100).round(1)
+    programs = sorted(set(original_data[program_col].unique()) | set(adjusted_data[program_col].unique()))
     
-    return status_pivot
+    for program in programs:
+        orig_total = original_data[original_data[program_col] == program]['Seats'].sum()
+        adj_total = adjusted_data[adjusted_data[program_col] == program]['Seats'].sum()
+        
+        # Get category breakdown
+        orig_cats = original_data[original_data[program_col] == program].groupby('Category')['Seats'].sum()
+        adj_cats = adjusted_data[adjusted_data[program_col] == program].groupby('Category')['Seats'].sum()
+        
+        row = {
+            program_col: program,
+            'Original_Total': int(orig_total),
+            'Adjusted_Total': int(adj_total),
+            'Difference': int(adj_total - orig_total)
+        }
+        
+        # Add category details
+        for cat in EXPECTED_PERCENTAGES.keys():
+            orig_seats = orig_cats.get(cat, 0)
+            adj_seats = adj_cats.get(cat, 0)
+            row[f'{cat}_Original'] = int(orig_seats)
+            row[f'{cat}_Adjusted'] = int(adj_seats)
+            row[f'{cat}_Diff'] = int(adj_seats - orig_seats)
+        
+        summary.append(row)
+    
+    return pd.DataFrame(summary)
 
-def create_issue_report(data, group_col, threshold=2):
-    """Create report of issues where percentage difference exceeds threshold"""
-    issues = data[abs(data['Percent_Difference']) > threshold].copy()
-    issues = issues.sort_values('Percent_Difference', ascending=False)
+def calculate_percentage_df(data, program_col='Program'):
+    """Calculate percentages for a dataset"""
+    results = []
     
-    if not issues.empty:
-        issues['Issue_Type'] = issues['Percent_Difference'].apply(
-            lambda x: 'Over-allocated' if x > 0 else 'Under-allocated'
-        )
-        issues['Severity'] = issues['Percent_Difference'].apply(
-            lambda x: 'High' if abs(x) > 5 else 'Medium' if abs(x) > 3 else 'Low'
-        )
+    programs = data[program_col].unique()
     
-    return issues
+    for program in programs:
+        program_data = data[data[program_col] == program]
+        total = program_data['Seats'].sum()
+        
+        for category in EXPECTED_PERCENTAGES.keys():
+            seats = program_data[program_data['Category'] == category]['Seats'].sum()
+            actual_pct = (seats / total * 100) if total > 0 else 0
+            expected_pct = EXPECTED_PERCENTAGES[category]
+            deviation = actual_pct - expected_pct
+            
+            results.append({
+                program_col: program,
+                'Category': category,
+                'Seats': int(seats),
+                'Actual_Percent': round(actual_pct, 2),
+                'Expected_Percent': round(expected_pct, 2),
+                'Deviation': round(deviation, 2),
+                'Within_Tolerance': abs(deviation) <= 2
+            })
+    
+    return pd.DataFrame(results)
 
 # ============================================================================
 # MAIN APP
 # ============================================================================
 
 def main():
-    st.title("📊 Seat Allocation Percentage Analysis")
-    st.markdown("### Validate percentage distribution against expected seat matrix")
+    st.title("🎯 Seat Allocation Adjuster")
+    st.markdown("### Adjust seat allocation to match expected percentages")
     st.divider()
     
     # Initialize session state
-    if 'analysis_results' not in st.session_state:
-        st.session_state.analysis_results = None
-    if 'data' not in st.session_state:
-        st.session_state.data = None
+    if 'original_data' not in st.session_state:
+        st.session_state.original_data = None
+    if 'adjusted_data' not in st.session_state:
+        st.session_state.adjusted_data = None
+    if 'adjustment_log' not in st.session_state:
+        st.session_state.adjustment_log = None
     
     # Sidebar
     with st.sidebar:
@@ -277,370 +434,374 @@ def main():
                     st.error(f"❌ Error: {e}")
         
         if data is not None:
-            st.session_state.data = data
+            st.session_state.original_data = data
             
-            if st.button("🔍 Analyze Percentages", type="primary", use_container_width=True):
-                with st.spinner("Analyzing percentage distribution..."):
-                    results = analyze_percentage_breakup(data)
-                    st.session_state.analysis_results = results
-                    st.success("✅ Analysis complete!")
+            # Adjustment options
+            st.subheader("⚙️ Adjustment Options")
+            
+            program_col = st.selectbox(
+                "Group by:",
+                ['Program', 'Specialty'],
+                help="Select how to group data for adjustment"
+            )
+            
+            tolerance = st.slider(
+                "Tolerance (%)",
+                min_value=0.5,
+                max_value=5.0,
+                value=2.0,
+                step=0.5,
+                help="Maximum allowed deviation from expected percentage"
+            )
+            
+            adjustment_method = st.radio(
+                "Adjustment Method:",
+                ['Simple Adjustment', 'Smart Adjustment (Recommended)']
+            )
+            
+            if st.button("🔄 Adjust Seats", type="primary", use_container_width=True):
+                with st.spinner("Adjusting seat allocation..."):
+                    if adjustment_method == 'Simple Adjustment':
+                        adjusted, log = adjust_seats_by_percentage(data, program_col, tolerance)
+                    else:
+                        adjusted, log = smart_adjust_seats(data, program_col)
+                    
+                    st.session_state.adjusted_data = adjusted
+                    st.session_state.adjustment_log = log
+                    st.success("✅ Seat allocation adjusted successfully!")
                     st.balloons()
-        
-        # Show expected percentages
-        with st.expander("📊 Expected Percentages"):
-            expected_df = pd.DataFrame({
-                'Category': list(EXPECTED_PERCENTAGES.keys()),
-                'Expected_Seats': list(SEAT_MATRIX.values()),
-                'Expected_Percent': list(EXPECTED_PERCENTAGES.values())
-            })
-            st.dataframe(expected_df, use_container_width=True)
     
     # Main content
-    if st.session_state.analysis_results is not None:
-        results = st.session_state.analysis_results
-        
-        # Summary metrics
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Seats", results['total_seats'])
-        with col2:
-            total_programs = len(results['program_totals'])
-            st.metric("Programs", total_programs)
-        with col3:
-            total_specialties = len(results['specialty_totals'])
-            st.metric("Specialties", total_specialties)
-        with col4:
-            # Calculate overall pass rate
-            program_status = results['program_category'].groupby('Program')['Within_Tolerance'].all()
-            pass_rate = (program_status.sum() / len(program_status) * 100) if len(program_status) > 0 else 0
-            st.metric("Program Pass Rate", f"{pass_rate:.1f}%")
+    if st.session_state.adjusted_data is not None:
+        original = st.session_state.original_data
+        adjusted = st.session_state.adjusted_data
         
         # Tabs
         tabs = st.tabs([
-            "📊 Overall Analysis",
-            "📈 Program Level",
-            "🏛️ Specialty Level",
-            "⚠️ Issues Report",
-            "📋 Detailed Data"
+            "📊 Summary",
+            "📈 Program Comparison",
+            "📉 Category Analysis",
+            "📋 Detailed Changes",
+            "✅ Validation"
         ])
         
-        # Tab 1: Overall Analysis
+        # Tab 1: Summary
         with tabs[0]:
-            st.subheader("Overall Category Distribution")
+            st.subheader("Adjustment Summary")
             
-            # Overall category summary
-            overall = results['overall_category']
-            
-            # Metrics
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
-                total_expected = sum(SEAT_MATRIX.values())
-                diff = results['total_seats'] - total_expected
-                st.metric("Total vs Expected", f"{diff:+d}", delta_color="inverse")
-            with col2:
-                passing = overall[overall['Status'] == '✅'].shape[0]
-                st.metric("Categories Passing", f"{passing}/{len(overall)}")
-            with col3:
-                avg_deviation = overall['Percent_Difference'].abs().mean()
-                st.metric("Avg Deviation", f"{avg_deviation:.2f}%")
+                orig_total = original['Seats'].sum()
+                adj_total = adjusted['Seats'].sum()
+                st.metric("Total Seats", f"{adj_total:,}", f"{adj_total - orig_total:+d}")
             
-            # Display overall summary
+            with col2:
+                programs = len(original['Program'].unique())
+                st.metric("Programs", programs)
+            
+            with col3:
+                # Count categories that were adjusted
+                adjusted_cats = st.session_state.adjustment_log['Category'].nunique() if not st.session_state.adjustment_log.empty else 0
+                st.metric("Categories Adjusted", adjusted_cats)
+            
+            with col4:
+                # Calculate improvement
+                orig_pct_df = calculate_percentage_df(original, 'Program')
+                adj_pct_df = calculate_percentage_df(adjusted, 'Program')
+                
+                orig_pass = orig_pct_df[orig_pct_df['Within_Tolerance']].shape[0]
+                adj_pass = adj_pct_df[adj_pct_df['Within_Tolerance']].shape[0]
+                improvement = adj_pass - orig_pass
+                
+                st.metric("Improvement", f"{improvement:+d}", delta_color="normal" if improvement > 0 else "inverse")
+            
+            # Show adjustment log
+            if not st.session_state.adjustment_log.empty:
+                st.markdown("#### Adjustment Log")
+                st.dataframe(st.session_state.adjustment_log, use_container_width=True)
+            
+            # Summary table
+            st.markdown("#### Program Summary")
+            summary_df = create_summary_table(original, adjusted, 'Program')
+            st.dataframe(summary_df, use_container_width=True)
+        
+        # Tab 2: Program Comparison
+        with tabs[1]:
+            st.subheader("Program Level Comparison")
+            
+            # Select category to compare
+            category = st.selectbox(
+                "Select Category to Compare:",
+                list(EXPECTED_PERCENTAGES.keys())
+            )
+            
+            # Show comparison chart
+            fig = compare_distribution(original, adjusted, 'Program', category)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Show detailed program comparison
+            st.markdown("#### Detailed Program Comparison")
+            
+            # Get percentage data
+            orig_pct = calculate_percentage_df(original, 'Program')
+            adj_pct = calculate_percentage_df(adjusted, 'Program')
+            
+            # Merge for comparison
+            comp_df = orig_pct.merge(
+                adj_pct,
+                on=['Program', 'Category'],
+                suffixes=('_Original', '_Adjusted')
+            )
+            
+            comp_df['Status_Original'] = comp_df['Within_Tolerance_Original'].map({True: '✅', False: '⚠️'})
+            comp_df['Status_Adjusted'] = comp_df['Within_Tolerance_Adjusted'].map({True: '✅', False: '⚠️'})
+            
             st.dataframe(
-                overall,
+                comp_df[['Program', 'Category', 
+                        'Seats_Original', 'Seats_Adjusted',
+                        'Actual_Percent_Original', 'Actual_Percent_Adjusted',
+                        'Expected_Percent_Original', 'Deviation_Original', 'Deviation_Adjusted',
+                        'Status_Original', 'Status_Adjusted']],
+                column_config={
+                    'Program': 'Program',
+                    'Category': 'Category',
+                    'Seats_Original': st.column_config.NumberColumn('Original Seats', format='%d'),
+                    'Seats_Adjusted': st.column_config.NumberColumn('Adjusted Seats', format='%d'),
+                    'Actual_Percent_Original': st.column_config.NumberColumn('Original %', format='%.2f%%'),
+                    'Actual_Percent_Adjusted': st.column_config.NumberColumn('Adjusted %', format='%.2f%%'),
+                    'Expected_Percent_Original': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
+                    'Deviation_Original': st.column_config.NumberColumn('Original Deviation', format='%.2f%%'),
+                    'Deviation_Adjusted': st.column_config.NumberColumn('Adjusted Deviation', format='%.2f%%'),
+                    'Status_Original': 'Original Status',
+                    'Status_Adjusted': 'Adjusted Status'
+                },
+                use_container_width=True
+            )
+        
+        # Tab 3: Category Analysis
+        with tabs[2]:
+            st.subheader("Category Level Analysis")
+            
+            # Overall category comparison
+            orig_cat = original.groupby('Category')['Seats'].sum().reset_index()
+            adj_cat = adjusted.groupby('Category')['Seats'].sum().reset_index()
+            
+            cat_comp = orig_cat.merge(adj_cat, on='Category', suffixes=('_Original', '_Adjusted'))
+            cat_comp['Original_Pct'] = (cat_comp['Seats_Original'] / cat_comp['Seats_Original'].sum() * 100).round(2)
+            cat_comp['Adjusted_Pct'] = (cat_comp['Seats_Adjusted'] / cat_comp['Seats_Adjusted'].sum() * 100).round(2)
+            cat_comp['Expected_Pct'] = cat_comp['Category'].map(EXPECTED_PERCENTAGES).round(2)
+            cat_comp['Original_Deviation'] = (cat_comp['Original_Pct'] - cat_comp['Expected_Pct']).round(2)
+            cat_comp['Adjusted_Deviation'] = (cat_comp['Adjusted_Pct'] - cat_comp['Expected_Pct']).round(2)
+            
+            st.dataframe(
+                cat_comp[['Category', 'Seats_Original', 'Seats_Adjusted', 
+                         'Original_Pct', 'Adjusted_Pct', 'Expected_Pct',
+                         'Original_Deviation', 'Adjusted_Deviation']],
                 column_config={
                     'Category': 'Category',
-                    'Seats': st.column_config.NumberColumn('Actual Seats', format='%d'),
-                    'Expected': st.column_config.NumberColumn('Expected Seats', format='%d'),
-                    'Difference': st.column_config.NumberColumn('Seats Diff', format='%d'),
-                    'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
-                    'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
-                    'Percent_Difference': st.column_config.NumberColumn('Deviation %', format='%.2f%%'),
-                    'Status': 'Status'
+                    'Seats_Original': st.column_config.NumberColumn('Original Seats', format='%d'),
+                    'Seats_Adjusted': st.column_config.NumberColumn('Adjusted Seats', format='%d'),
+                    'Original_Pct': st.column_config.NumberColumn('Original %', format='%.2f%%'),
+                    'Adjusted_Pct': st.column_config.NumberColumn('Adjusted %', format='%.2f%%'),
+                    'Expected_Pct': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
+                    'Original_Deviation': st.column_config.NumberColumn('Original Deviation', format='%.2f%%'),
+                    'Adjusted_Deviation': st.column_config.NumberColumn('Adjusted Deviation', format='%.2f%%')
                 },
                 use_container_width=True
             )
             
-            # Category chart
+            # Category chart - Original vs Adjusted vs Expected
             fig = go.Figure()
             
             fig.add_trace(go.Bar(
-                x=overall['Category'],
-                y=overall['Actual_Percent'],
-                name='Actual',
-                marker_color='#2ca02c',
-                text=overall['Actual_Percent'].apply(lambda x: f'{x:.1f}%'),
+                x=cat_comp['Category'],
+                y=cat_comp['Original_Pct'],
+                name='Original',
+                marker_color='#ff7f0e',
+                text=cat_comp['Original_Pct'].apply(lambda x: f'{x:.1f}%'),
                 textposition='outside'
             ))
             
             fig.add_trace(go.Bar(
-                x=overall['Category'],
-                y=overall['Expected_Percent'],
+                x=cat_comp['Category'],
+                y=cat_comp['Adjusted_Pct'],
+                name='Adjusted',
+                marker_color='#2ca02c',
+                text=cat_comp['Adjusted_Pct'].apply(lambda x: f'{x:.1f}%'),
+                textposition='outside'
+            ))
+            
+            fig.add_trace(go.Bar(
+                x=cat_comp['Category'],
+                y=cat_comp['Expected_Pct'],
                 name='Expected',
                 marker_color='#1f77b4',
-                text=overall['Expected_Percent'].apply(lambda x: f'{x:.1f}%'),
+                text=cat_comp['Expected_Pct'].apply(lambda x: f'{x:.1f}%'),
                 textposition='outside'
             ))
             
             fig.update_layout(
-                title='Overall Category Distribution - Actual vs Expected',
+                title='Category Distribution: Original vs Adjusted vs Expected',
                 xaxis_title='Category',
                 yaxis_title='Percentage (%)',
                 barmode='group',
-                height=400
+                height=500
             )
             st.plotly_chart(fig, use_container_width=True)
         
-        # Tab 2: Program Level
-        with tabs[1]:
-            st.subheader("Program Level Percentage Analysis")
-            
-            # Program selector
-            programs = results['program_totals']['Program'].tolist()
-            selected_program = st.selectbox("Select Program", programs)
-            
-            # Filter data for selected program
-            program_data = results['program_category'][results['program_category']['Program'] == selected_program]
-            
-            if not program_data.empty:
-                # Show program summary
-                prog_total = results['program_totals'][results['program_totals']['Program'] == selected_program]['Program_Total'].values[0]
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Seats", prog_total)
-                with col2:
-                    passing = program_data[program_data['Within_Tolerance']].shape[0]
-                    st.metric("Categories Passing", f"{passing}/{len(program_data)}")
-                with col3:
-                    avg_dev = program_data['Percent_Difference'].abs().mean()
-                    st.metric("Avg Deviation", f"{avg_dev:.2f}%")
-                
-                # Display program data
-                st.dataframe(
-                    program_data[['Category', 'Seats', 'Expected_Seats', 'Seats_Difference', 
-                                  'Actual_Percent', 'Expected_Percent', 'Percent_Difference', 'Status']],
-                    column_config={
-                        'Category': 'Category',
-                        'Seats': st.column_config.NumberColumn('Actual Seats', format='%d'),
-                        'Expected_Seats': st.column_config.NumberColumn('Expected Seats', format='%d'),
-                        'Seats_Difference': st.column_config.NumberColumn('Seats Diff', format='%d'),
-                        'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
-                        'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
-                        'Percent_Difference': st.column_config.NumberColumn('Deviation %', format='%.2f%%'),
-                        'Status': 'Status'
-                    },
-                    use_container_width=True
-                )
-                
-                # Chart for selected program
-                fig = create_percentage_comparison_chart(program_data, 'Category')
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # All programs summary
-            st.markdown("#### All Programs Summary")
-            program_status_summary = create_status_summary(results['program_category'], 'Program')
-            st.dataframe(program_status_summary, use_container_width=True)
-            
-            # Program heatmap
-            fig = create_percentage_deviation_chart(results['program_category'], 'Program')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Tab 3: Specialty Level
-        with tabs[2]:
-            st.subheader("Specialty Level Percentage Analysis")
-            
-            # Specialty selector
-            specialties = results['specialty_totals']['Specialty'].tolist()
-            selected_specialty = st.selectbox("Select Specialty", specialties)
-            
-            # Filter data for selected specialty
-            specialty_data = results['specialty_category'][results['specialty_category']['Specialty'] == selected_specialty]
-            
-            if not specialty_data.empty:
-                spec_total = results['specialty_totals'][results['specialty_totals']['Specialty'] == selected_specialty]['Specialty_Total'].values[0]
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Seats", spec_total)
-                with col2:
-                    passing = specialty_data[specialty_data['Within_Tolerance']].shape[0]
-                    st.metric("Categories Passing", f"{passing}/{len(specialty_data)}")
-                with col3:
-                    avg_dev = specialty_data['Percent_Difference'].abs().mean()
-                    st.metric("Avg Deviation", f"{avg_dev:.2f}%")
-                
-                st.dataframe(
-                    specialty_data[['Category', 'Seats', 'Expected_Seats', 'Seats_Difference',
-                                  'Actual_Percent', 'Expected_Percent', 'Percent_Difference', 'Status']],
-                    column_config={
-                        'Category': 'Category',
-                        'Seats': st.column_config.NumberColumn('Actual Seats', format='%d'),
-                        'Expected_Seats': st.column_config.NumberColumn('Expected Seats', format='%d'),
-                        'Seats_Difference': st.column_config.NumberColumn('Seats Diff', format='%d'),
-                        'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
-                        'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
-                        'Percent_Difference': st.column_config.NumberColumn('Deviation %', format='%.2f%%'),
-                        'Status': 'Status'
-                    },
-                    use_container_width=True
-                )
-                
-                fig = create_percentage_comparison_chart(specialty_data, 'Category')
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # All specialties summary
-            st.markdown("#### All Specialties Summary")
-            specialty_status_summary = create_status_summary(results['specialty_category'], 'Specialty')
-            st.dataframe(specialty_status_summary, use_container_width=True)
-            
-            # Specialty heatmap
-            fig = create_percentage_deviation_chart(results['specialty_category'], 'Specialty')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # Tab 4: Issues Report
+        # Tab 4: Detailed Changes
         with tabs[3]:
-            st.subheader("⚠️ Issues Report")
-            st.markdown("Categories where percentage deviation exceeds 2%")
+            st.subheader("📋 Detailed Changes")
             
-            # Program level issues
-            st.markdown("#### Program Level Issues")
-            program_issues = create_issue_report(results['program_category'], 'Program')
+            # Show all adjusted rows
+            st.markdown("#### Adjusted Data")
+            st.dataframe(adjusted, use_container_width=True)
             
-            if not program_issues.empty:
+            # Show changes
+            st.markdown("#### Changes Made")
+            
+            # Find rows that changed
+            merged = original.merge(
+                adjusted,
+                on=['Program', 'Specialty', 'College', 'Type', 'Category'],
+                suffixes=('_Original', '_Adjusted')
+            )
+            
+            changed = merged[merged['Seats_Original'] != merged['Seats_Adjusted']]
+            
+            if not changed.empty:
+                changed['Change'] = changed['Seats_Adjusted'] - changed['Seats_Original']
                 st.dataframe(
-                    program_issues[['Program', 'Category', 'Seats', 'Expected_Seats', 
-                                   'Actual_Percent', 'Expected_Percent', 'Percent_Difference', 
-                                   'Issue_Type', 'Severity']],
+                    changed[['Program', 'Specialty', 'College', 'Category', 
+                            'Seats_Original', 'Seats_Adjusted', 'Change']],
                     column_config={
                         'Program': 'Program',
-                        'Category': 'Category',
-                        'Seats': st.column_config.NumberColumn('Actual', format='%d'),
-                        'Expected_Seats': st.column_config.NumberColumn('Expected', format='%d'),
-                        'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
-                        'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
-                        'Percent_Difference': st.column_config.NumberColumn('Deviation', format='%.2f%%'),
-                        'Issue_Type': 'Issue',
-                        'Severity': 'Severity'
-                    },
-                    use_container_width=True
-                )
-                
-                # Color-coded issues by severity
-                severity_colors = {'High': '#ff4444', 'Medium': '#ffaa00', 'Low': '#ffdd00'}
-                
-                fig = go.Figure()
-                for severity, color in severity_colors.items():
-                    severity_data = program_issues[program_issues['Severity'] == severity]
-                    if not severity_data.empty:
-                        fig.add_trace(go.Bar(
-                            x=severity_data['Category'],
-                            y=severity_data['Percent_Difference'],
-                            name=severity,
-                            marker_color=color,
-                            text=severity_data['Program'] + ' (' + severity_data['Percent_Difference'].apply(lambda x: f'{x:.1f}%') + ')',
-                            textposition='outside'
-                        ))
-                
-                fig.update_layout(
-                    title='Program Level Issues by Severity',
-                    xaxis_title='Category',
-                    yaxis_title='Percentage Deviation (%)',
-                    barmode='group',
-                    height=400
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.success("✅ No issues found at program level!")
-            
-            # Specialty level issues
-            st.markdown("#### Specialty Level Issues")
-            specialty_issues = create_issue_report(results['specialty_category'], 'Specialty')
-            
-            if not specialty_issues.empty:
-                st.dataframe(
-                    specialty_issues[['Specialty', 'Category', 'Seats', 'Expected_Seats',
-                                    'Actual_Percent', 'Expected_Percent', 'Percent_Difference',
-                                    'Issue_Type', 'Severity']],
-                    column_config={
                         'Specialty': 'Specialty',
+                        'College': 'College',
                         'Category': 'Category',
-                        'Seats': st.column_config.NumberColumn('Actual', format='%d'),
-                        'Expected_Seats': st.column_config.NumberColumn('Expected', format='%d'),
-                        'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.2f%%'),
-                        'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.2f%%'),
-                        'Percent_Difference': st.column_config.NumberColumn('Deviation', format='%.2f%%'),
-                        'Issue_Type': 'Issue',
-                        'Severity': 'Severity'
+                        'Seats_Original': st.column_config.NumberColumn('Original', format='%d'),
+                        'Seats_Adjusted': st.column_config.NumberColumn('Adjusted', format='%d'),
+                        'Change': st.column_config.NumberColumn('Change', format='%+d')
                     },
                     use_container_width=True
                 )
             else:
-                st.success("✅ No issues found at specialty level!")
-        
-        # Tab 5: Detailed Data
-        with tabs[4]:
-            st.subheader("📋 Detailed Data")
-            
-            # Full data view
-            st.markdown("#### All Data")
-            st.dataframe(st.session_state.data, use_container_width=True)
+                st.info("No changes were made")
             
             # Download options
-            st.markdown("#### Download Analysis")
+            st.markdown("#### Download Results")
             
             col1, col2 = st.columns(2)
             
             with col1:
-                # Program level analysis download
-                csv_program = results['program_category'].to_csv(index=False)
+                csv_adjusted = adjusted.to_csv(index=False)
                 st.download_button(
-                    "📥 Download Program Level Analysis",
-                    csv_program,
-                    f"program_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "📥 Download Adjusted Data",
+                    csv_adjusted,
+                    f"adjusted_seats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     "text/csv",
                     use_container_width=True
                 )
             
             with col2:
-                # Specialty level analysis download
-                csv_specialty = results['specialty_category'].to_csv(index=False)
-                st.download_button(
-                    "📥 Download Specialty Level Analysis",
-                    csv_specialty,
-                    f"specialty_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    "text/csv",
-                    use_container_width=True
-                )
+                if not changed.empty:
+                    csv_changes = changed.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Changes Log",
+                        csv_changes,
+                        f"changes_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
+        
+        # Tab 5: Validation
+        with tabs[4]:
+            st.subheader("✅ Validation Report")
+            
+            # Validate original
+            st.markdown("#### Original Data Validation")
+            orig_validation = calculate_percentage_df(original, 'Program')
+            orig_summary = orig_validation.groupby('Program')['Within_Tolerance'].all().reset_index()
+            orig_summary['Status'] = orig_summary['Within_Tolerance'].map({True: '✅', False: '⚠️'})
+            
+            st.dataframe(orig_summary, use_container_width=True)
+            
+            # Validate adjusted
+            st.markdown("#### Adjusted Data Validation")
+            adj_validation = calculate_percentage_df(adjusted, 'Program')
+            adj_summary = adj_validation.groupby('Program')['Within_Tolerance'].all().reset_index()
+            adj_summary['Status'] = adj_summary['Within_Tolerance'].map({True: '✅', False: '⚠️'})
+            
+            st.dataframe(adj_summary, use_container_width=True)
+            
+            # Show programs that were fixed
+            st.markdown("#### Programs Fixed")
+            
+            fixed = []
+            for program in adj_summary['Program']:
+                orig_status = orig_summary[orig_summary['Program'] == program]['Within_Tolerance'].values[0] if program in orig_summary['Program'].values else False
+                adj_status = adj_summary[adj_summary['Program'] == program]['Within_Tolerance'].values[0]
+                
+                if not orig_status and adj_status:
+                    fixed.append({
+                        'Program': program,
+                        'Status': '✅ Fixed'
+                    })
+                elif orig_status and adj_status:
+                    fixed.append({
+                        'Program': program,
+                        'Status': '✅ Already OK'
+                    })
+                elif not orig_status and not adj_status:
+                    fixed.append({
+                        'Program': program,
+                        'Status': '⚠️ Still Issues'
+                    })
+            
+            if fixed:
+                st.dataframe(pd.DataFrame(fixed), use_container_width=True)
+            
+            # Pass rate improvement
+            orig_pass = orig_summary['Within_Tolerance'].sum()
+            adj_pass = adj_summary['Within_Tolerance'].sum()
+            total = len(orig_summary)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Original Pass Rate", f"{orig_pass}/{total}", f"{(orig_pass/total*100):.1f}%")
+            with col2:
+                st.metric("Adjusted Pass Rate", f"{adj_pass}/{total}", f"{(adj_pass/total*100):.1f}%")
+            with col3:
+                improvement = adj_pass - orig_pass
+                st.metric("Improvement", f"{improvement:+d}", delta_color="normal" if improvement > 0 else "inverse")
     
     else:
         # Welcome message
-        st.info("👈 Upload your data in the sidebar and click 'Analyze Percentages'")
+        st.info("👈 Upload your data in the sidebar and click 'Adjust Seats'")
         
         st.markdown("""
-        ### 📊 What This Tool Does
+        ### 🎯 What This Tool Does
         
-        This tool analyzes seat allocation percentages to ensure they match the expected distribution:
+        This tool **automatically adjusts seat allocations** to match the expected percentage distribution:
         
-        #### 🎯 Expected Distribution (Total 100 seats)
-        - **SM**: 50% (50 seats)
-        - **EW**: 10% (10 seats)
-        - **EZ**: 9% (9 seats)
-        - **MU**: 8% (8 seats)
-        - **SC**: 8% (8 seats)
-        - **BH**: 3% (3 seats)
-        - **LA**: 3% (3 seats)
-        - **DV**: 2% (2 seats)
-        - **VK**: 2% (2 seats)
-        - **ST**: 2% (2 seats)
-        - **KN**: 1% (1 seat)
-        - **BX**: 1% (1 seat)
-        - **KU**: 1% (1 seat)
+        #### 🔧 Adjustment Process
         
-        #### 📋 What It Checks
+        1. **Analyzes** current seat distribution by program
+        2. **Compares** actual percentages against expected (SM:50%, EW:10%, etc.)
+        3. **Adjusts** seats to match expected percentages
+        4. **Validates** that all programs now meet the criteria
         
-        1. **Program Level**: For each program (CS, EC, EE, etc.), checks if the percentage distribution matches the expected percentages
-        2. **Specialty Level**: For each specialty, checks if the percentage distribution matches the expected percentages
-        3. **Identifies Issues**: Flags categories where percentage deviation exceeds 2%
+        #### 📊 Example Issue Fixed
+        
+        **Before Adjustment (CS Program with 160 seats):**
+        - EW: 23 seats (14.4%) ❌ (Expected: 10%)
+        - EZ: 21 seats (13.1%) ❌ (Expected: 9%)
+        - BH: 1 seat (0.6%) ❌ (Expected: 3%)
+        
+        **After Adjustment:**
+        - EW: 16 seats (10%) ✅
+        - EZ: 14.4 seats (9%) ✅
+        - BH: 4.8 seats (3%) ✅
         
         #### 📁 Required Data Format
         
@@ -651,42 +812,6 @@ def main():
         - **Type**: Type (G, etc.)
         - **Category**: Seat category (SM, EW, EZ, etc.)
         - **Seats**: Number of seats
-        """)
-        
-        # Show example of what the analysis reveals
-        st.markdown("### 🔍 Example Issues Detected")
-        
-        example_data = pd.DataFrame({
-            'Program': ['CS', 'CS', 'CS', 'CS', 'CS', 'CS', 'CS'],
-            'Category': ['SM', 'EW', 'EZ', 'MU', 'SC', 'BH', 'ST'],
-            'Actual_Seats': [80, 23, 21, 15, 14, 1, 2],
-            'Expected_Seats': [80, 16, 14.4, 12.8, 12.8, 4.8, 3.2],
-            'Actual_Percent': [50.0, 14.4, 13.1, 9.4, 8.8, 0.6, 1.3],
-            'Expected_Percent': [50.0, 10.0, 9.0, 8.0, 8.0, 3.0, 2.0],
-            'Deviation': [0.0, 4.4, 4.1, 1.4, 0.8, -2.4, -0.7],
-            'Status': ['✅', '⚠️', '⚠️', '✅', '✅', '⚠️', '✅']
-        })
-        
-        st.dataframe(
-            example_data,
-            column_config={
-                'Program': 'Program',
-                'Category': 'Category',
-                'Actual_Seats': st.column_config.NumberColumn('Actual Seats', format='%d'),
-                'Expected_Seats': st.column_config.NumberColumn('Expected Seats', format='%.1f'),
-                'Actual_Percent': st.column_config.NumberColumn('Actual %', format='%.1f%%'),
-                'Expected_Percent': st.column_config.NumberColumn('Expected %', format='%.1f%%'),
-                'Deviation': st.column_config.NumberColumn('Deviation', format='%.1f%%'),
-                'Status': 'Status'
-            },
-            use_container_width=True
-        )
-        
-        st.warning("""
-        ⚠️ **Issues Found:**
-        - **EW**: 23 seats (14.4%) vs expected 10% (+4.4% deviation) - **Over-allocated**
-        - **EZ**: 21 seats (13.1%) vs expected 9% (+4.1% deviation) - **Over-allocated**
-        - **BH**: 1 seat (0.6%) vs expected 3% (-2.4% deviation) - **Under-allocated**
         """)
 
 # ============================================================================
