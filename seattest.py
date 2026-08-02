@@ -67,10 +67,10 @@ def process_allocated_data(data):
         'specialty_summary': specialty_summary,
         'program_summary': program_summary,
         'pivot_csc': pivot_csc,
-        'total_seats': data['Seats'].sum(),
-        'total_categories': len(data['Category'].unique()),
-        'total_colleges': len(data['College'].unique()),
-        'total_specialties': len(data['Specialty'].unique())
+        'total_seats': int(data['Seats'].sum()),
+        'total_categories': int(len(data['Category'].unique())),
+        'total_colleges': int(len(data['College'].unique())),
+        'total_specialties': int(len(data['Specialty'].unique()))
     }
 
 def validate_allocations(data):
@@ -85,7 +85,7 @@ def validate_allocations(data):
         status = '✅' if actual == expected else '⚠️'
         validation_results.append({
             'Category': category,
-            'Expected': expected,
+            'Expected': int(expected),
             'Actual': int(actual),
             'Difference': int(actual - expected),
             'Status': status
@@ -97,7 +97,7 @@ def validate_allocations(data):
     status = '✅' if total_actual == total_expected else '⚠️'
     validation_results.append({
         'Category': 'TOTAL',
-        'Expected': total_expected,
+        'Expected': int(total_expected),
         'Actual': int(total_actual),
         'Difference': int(total_actual - total_expected),
         'Status': status
@@ -956,7 +956,7 @@ def main():
             st.markdown("#### All Data")
             st.dataframe(data, use_container_width=True)
         
-        # Tab 6: Validation - FIXED VERSION
+        # Tab 6: Validation
         with tabs[5]:
             st.subheader("Data Validation")
             
@@ -977,27 +977,15 @@ def main():
             - **KU**: 1 seat
             """)
             
-            # Create a styled dataframe manually
-            validation_display = validation_df.copy()
-            
-            # Add a status column with emojis and color using HTML
-            def format_status(row):
-                if row['Status'] == '✅':
-                    return '✅'
-                else:
-                    return '⚠️'
-            
-            validation_display['Status_Display'] = validation_display.apply(format_status, axis=1)
-            
-            # Display the validation results
+            # Display validation results
             st.dataframe(
-                validation_display[['Category', 'Expected', 'Actual', 'Difference', 'Status_Display']],
+                validation_df,
                 column_config={
                     'Category': 'Category',
-                    'Expected': 'Expected',
-                    'Actual': 'Actual',
-                    'Difference': 'Difference',
-                    'Status_Display': 'Status'
+                    'Expected': st.column_config.NumberColumn('Expected', format='%d'),
+                    'Actual': st.column_config.NumberColumn('Actual', format='%d'),
+                    'Difference': st.column_config.NumberColumn('Difference', format='%d'),
+                    'Status': 'Status'
                 },
                 use_container_width=True
             )
@@ -1019,7 +1007,7 @@ def main():
                         use_container_width=True
                     )
         
-        # Tab 7: Download
+        # Tab 7: Download - FIXED JSON SERIALIZATION
         with tabs[6]:
             st.subheader("📥 Download Results")
             
@@ -1037,11 +1025,11 @@ def main():
                 )
             
             with col2:
-                # Download JSON
+                # Download JSON - Fixed to handle numpy types
                 json_data = {
                     'timestamp': datetime.now().isoformat(),
                     'seat_matrix': SEAT_MATRIX,
-                    'total_seats': processed['total_seats'],
+                    'total_seats': int(processed['total_seats']),
                     'summary': {
                         'category_summary': processed['category_summary'].to_dict('records'),
                         'college_summary': processed['college_summary'].to_dict('records'),
@@ -1049,7 +1037,25 @@ def main():
                     },
                     'data': data.to_dict('records')
                 }
+                
+                # Convert any numpy types to Python native types
+                def convert_to_serializable(obj):
+                    if isinstance(obj, np.integer):
+                        return int(obj)
+                    elif isinstance(obj, np.floating):
+                        return float(obj)
+                    elif isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    elif isinstance(obj, dict):
+                        return {k: convert_to_serializable(v) for k, v in obj.items()}
+                    elif isinstance(obj, list):
+                        return [convert_to_serializable(item) for item in obj]
+                    else:
+                        return obj
+                
+                json_data = convert_to_serializable(json_data)
                 json_str = json.dumps(json_data, indent=2)
+                
                 st.download_button(
                     "📥 Download as JSON",
                     json_str,
