@@ -956,7 +956,7 @@ def main():
             st.markdown("#### All Data")
             st.dataframe(data, use_container_width=True)
         
-        # Tab 6: Validation
+        # Tab 6: Validation - FIXED VERSION
         with tabs[5]:
             st.subheader("Data Validation")
             
@@ -977,22 +977,35 @@ def main():
             - **KU**: 1 seat
             """)
             
-            # Validation results with color coding
-            def color_status(val):
-                if val == '✅':
-                    return 'color: green'
-                elif val == '⚠️':
-                    return 'color: orange'
-                return ''
+            # Create a styled dataframe manually
+            validation_display = validation_df.copy()
             
-            # Display validation with styling
+            # Add a status column with emojis and color using HTML
+            def format_status(row):
+                if row['Status'] == '✅':
+                    return '✅'
+                else:
+                    return '⚠️'
+            
+            validation_display['Status_Display'] = validation_display.apply(format_status, axis=1)
+            
+            # Display the validation results
             st.dataframe(
-                validation_df.style.applymap(color_status, subset=['Status']),
+                validation_display[['Category', 'Expected', 'Actual', 'Difference', 'Status_Display']],
+                column_config={
+                    'Category': 'Category',
+                    'Expected': 'Expected',
+                    'Actual': 'Actual',
+                    'Difference': 'Difference',
+                    'Status_Display': 'Status'
+                },
                 use_container_width=True
             )
             
             # Show validation summary
-            if (validation_df['Difference'] == 0).all():
+            all_match = (validation_df['Difference'] == 0).all()
+            
+            if all_match:
                 st.success("✅ All allocations match the expected seat matrix exactly!")
             else:
                 st.warning("⚠️ Some allocations differ from the expected seat matrix")
@@ -1001,7 +1014,10 @@ def main():
                 mismatches = validation_df[validation_df['Difference'] != 0]
                 if not mismatches.empty:
                     st.markdown("#### Mismatches found:")
-                    st.dataframe(mismatches, use_container_width=True)
+                    st.dataframe(
+                        mismatches[['Category', 'Expected', 'Actual', 'Difference']],
+                        use_container_width=True
+                    )
         
         # Tab 7: Download
         with tabs[6]:
