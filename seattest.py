@@ -702,7 +702,7 @@ def create_specialty_chart(specialty_summary, top_n=15):
     
     return fig
 
-def create_heatmap(data, category_col='Category', value_col='Seats'):
+def create_heatmap(data):
     """Create heatmap of allocations"""
     pivot = data.pivot_table(
         index='College',
@@ -977,12 +977,17 @@ def main():
             - **KU**: 1 seat
             """)
             
-            # Validation results
+            # Validation results with color coding
+            def color_status(val):
+                if val == '✅':
+                    return 'color: green'
+                elif val == '⚠️':
+                    return 'color: orange'
+                return ''
+            
+            # Display validation with styling
             st.dataframe(
-                validation_df.style.applymap(
-                    lambda x: 'color: green' if x == '✅' else 'color: orange' if x == '⚠️' else '',
-                    subset=['Status']
-                ),
+                validation_df.style.applymap(color_status, subset=['Status']),
                 use_container_width=True
             )
             
