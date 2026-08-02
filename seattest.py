@@ -21,10 +21,10 @@ st.set_page_config(
 # CONSTANTS
 # ============================================================================
 
-# Original seat matrix from the problem
+# Original seat matrix from the problem (values are also percentage points, sum = 100)
 SEAT_MATRIX = {
-    'SM': 50, 'EW': 10, 'EZ': 9, 'MU': 8, 'SC': 8, 
-    'BH': 3, 'LA': 3, 'DV': 2, 'VK': 2, 'ST': 2, 
+    'SM': 50, 'EW': 10, 'EZ': 9, 'MU': 8, 'SC': 8,
+    'BH': 3, 'LA': 3, 'DV': 2, 'VK': 2, 'ST': 2,
     'KN': 1, 'BX': 1, 'KU': 1
 }
 
@@ -42,22 +42,22 @@ def process_allocated_data(data):
     category_summary['Difference'] = category_summary['Seats'] - category_summary['Expected']
     category_summary['Accuracy'] = (category_summary['Seats'] / category_summary['Expected'] * 100).round(1)
     category_summary = category_summary.sort_values('Seats', ascending=False)
-    
+
     # Summary by Specialty
     specialty_summary = data.groupby('Specialty')['Seats'].sum().reset_index()
     specialty_summary = specialty_summary.sort_values('Seats', ascending=False)
-    
+
     # Summary by College
     college_summary = data.groupby('College')['Seats'].sum().reset_index()
     college_summary = college_summary.sort_values('Seats', ascending=False)
-    
+
     # Summary by Program
     program_summary = data.groupby('Program')['Seats'].sum().reset_index()
-    
+
     # Specialty-Category breakdown
     specialty_category = data.groupby(['Specialty', 'Category'])['Seats'].sum().reset_index()
     specialty_category = specialty_category.sort_values(['Specialty', 'Seats'], ascending=[True, False])
-    
+
     # Pivot: Specialty x Category
     specialty_category_pivot = data.pivot_table(
         index='Specialty',
@@ -66,7 +66,7 @@ def process_allocated_data(data):
         fill_value=0,
         aggfunc='sum'
     )
-    
+
     # Pivot: College x Category
     college_category_pivot = data.pivot_table(
         index='College',
@@ -75,7 +75,7 @@ def process_allocated_data(data):
         fill_value=0,
         aggfunc='sum'
     )
-    
+
     # Pivot: College x Specialty
     college_specialty_pivot = data.pivot_table(
         index='College',
@@ -84,13 +84,13 @@ def process_allocated_data(data):
         fill_value=0,
         aggfunc='sum'
     )
-    
+
     # Total seats by category
     total_by_category = data.groupby('Category')['Seats'].sum().to_dict()
-    
+
     # Total seats by specialty
     total_by_specialty = data.groupby('Specialty')['Seats'].sum().to_dict()
-    
+
     return {
         'category_summary': category_summary,
         'specialty_summary': specialty_summary,
@@ -110,13 +110,13 @@ def process_allocated_data(data):
 
 def validate_allocations(data):
     """
-    Validate that allocations match the seat matrix
+    Validate that OVERALL (grand total) allocations match the seat matrix
     """
     validation_results = []
-    
+
     # Get actual totals by category
     actual_totals = data.groupby('Category')['Seats'].sum().to_dict()
-    
+
     # Check each category
     for category, expected in SEAT_MATRIX.items():
         actual = actual_totals.get(category, 0)
@@ -128,7 +128,7 @@ def validate_allocations(data):
             'Difference': int(actual - expected),
             'Status': status
         })
-    
+
     # Check total
     total_actual = data['Seats'].sum()
     total_expected = sum(SEAT_MATRIX.values())
@@ -140,8 +140,77 @@ def validate_allocations(data):
         'Difference': int(total_actual - total_expected),
         'Status': status
     })
-    
+
     return pd.DataFrame(validation_results)
+
+
+def calculate_coursewise_compliance(data, tolerance_pts=2.0):
+    """
+    Check whether EACH Specialty (course) individually satisfies the SEAT_MATRIX
+    percentage distribution -- not just the grand total.
+
+    For every course, expected_seats(category) = course_total * matrix_pct / 100.
+    A category is flagged as:
+      - 'Missing'  -> it deserved at least ~0.5 of a seat but got literally zero
+      - '⚠️'        -> actual % deviates from expected % by more than `tolerance_pts`
+      - '✅'        -> within tolerance
+    """
+    results = []
+    total_pct = sum(SEAT_MATRIX.values())  # should be 100
+
+    for specialty, group in data.groupby('Specialty'):
+        course_total = group['Seats'].sum()
+        actual_by_cat = group.groupby('Category')['Seats'].sum().to_dict()
+
+        for category, pct in SEAT_MATRIX.items():
+            expected_seats = course_total * pct / total_pct
+            actual_seats = actual_by_cat.get(category, 0)
+            actual_pct = (actual_seats / course_total * 100) if course_total > 0 else 0
+            deviation_pts = actual_pct - pct
+
+            # Flag as "Missing" if the category deserved at least ~half a seat
+            # (i.e. would round to >=1 under any sane rounding rule) but got zero.
+            missing_mandatory = (expected_seats >= 0.5) and (actual_seats == 0)
+            exceeds_tolerance = abs(deviation_pts) > tolerance_pts
+
+            if missing_mandatory:
+                status = 'Missing'
+            elif exceeds_tolerance:
+                status = '⚠️'
+            else:
+                status = '✅'
+
+            results.append({
+                'Specialty': specialty,
+                'Category': category,
+                'Course Total': int(course_total),
+                'Expected %': round(pct, 2),
+                'Actual %': round(actual_pct, 2),
+                'Deviation (pts)': round(deviation_pts, 2),
+                'Expected Seats': round(expected_seats, 2),
+                'Actual Seats': int(actual_seats),
+                'Status': status
+            })
+
+    return pd.DataFrame(results)
+
+
+def summarize_coursewise_compliance(coursewise_df):
+    """Roll the category-level compliance table up to one row per course."""
+    summary = coursewise_df.groupby('Specialty').agg(
+        Course_Total=('Course Total', 'first'),
+        Category_Violations=('Status', lambda s: (s != '✅').sum()),
+        Missing_Mandatory_Categories=('Status', lambda s: (s == 'Missing').sum())
+    ).reset_index()
+    summary = summary.sort_values(
+        ['Missing_Mandatory_Categories', 'Category_Violations'],
+        ascending=False
+    )
+
+    fully_compliant = int((summary['Category_Violations'] == 0).sum())
+    total_courses = len(summary)
+
+    return summary, fully_compliant, total_courses
 
 # ============================================================================
 # SAMPLE DATA
@@ -663,7 +732,7 @@ E,DS,CDT,G,SM,2
 E,DS,CDT,G,EW,1
 E,DS,CDT,G,EZ,1
 E,DS,CDV,G,SM,1"""
-    
+
     df = pd.read_csv(StringIO(data))
     return df
 
@@ -674,7 +743,7 @@ E,DS,CDV,G,SM,1"""
 def create_category_chart(summary_data):
     """Create category distribution chart"""
     fig = go.Figure()
-    
+
     fig.add_trace(go.Bar(
         x=summary_data['Category'],
         y=summary_data['Seats'],
@@ -683,7 +752,7 @@ def create_category_chart(summary_data):
         text=summary_data['Seats'],
         textposition='outside'
     ))
-    
+
     fig.add_trace(go.Bar(
         x=summary_data['Category'],
         y=summary_data['Expected'],
@@ -692,7 +761,7 @@ def create_category_chart(summary_data):
         text=summary_data['Expected'],
         textposition='outside'
     ))
-    
+
     fig.update_layout(
         title='Category-wise Seat Allocation',
         xaxis_title='Category',
@@ -701,13 +770,13 @@ def create_category_chart(summary_data):
         height=400,
         legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99)
     )
-    
+
     return fig
 
 def create_specialty_chart(specialty_summary, top_n=20):
     """Create specialty distribution chart"""
     top_specialties = specialty_summary.head(top_n)
-    
+
     fig = px.bar(
         top_specialties,
         x='Specialty',
@@ -719,13 +788,13 @@ def create_specialty_chart(specialty_summary, top_n=20):
     )
     fig.update_traces(textposition='outside')
     fig.update_layout(height=500)
-    
+
     return fig
 
 def create_college_chart(college_summary, top_n=20):
     """Create college distribution chart"""
     top_colleges = college_summary.head(top_n)
-    
+
     fig = px.bar(
         top_colleges,
         x='College',
@@ -737,7 +806,7 @@ def create_college_chart(college_summary, top_n=20):
     )
     fig.update_traces(textposition='outside')
     fig.update_layout(height=500)
-    
+
     return fig
 
 def create_specialty_category_heatmap(data):
@@ -749,11 +818,11 @@ def create_specialty_category_heatmap(data):
         fill_value=0,
         aggfunc='sum'
     )
-    
+
     # Sort by total seats per specialty
     specialty_totals = data.groupby('Specialty')['Seats'].sum().sort_values(ascending=False)
     pivot = pivot.loc[specialty_totals.index]
-    
+
     fig = px.imshow(
         pivot,
         title='Specialty vs Category Heatmap',
@@ -766,7 +835,7 @@ def create_specialty_category_heatmap(data):
         xaxis_title='Category',
         yaxis_title='Specialty'
     )
-    
+
     return fig
 
 # ============================================================================
@@ -780,36 +849,42 @@ def convert_df_to_excel(df):
         df.to_excel(writer, index=False, sheet_name='Data')
     return output.getvalue()
 
-def create_download_data(data, processed, validation_df):
+def create_download_data(data, processed, validation_df, coursewise_df=None, coursewise_summary=None):
     """Create comprehensive download data"""
     download_data = {}
-    
+
     # Original data
     download_data['Original_Data'] = data
-    
+
     # Category summary
     download_data['Category_Summary'] = processed['category_summary']
-    
+
     # Specialty summary
     download_data['Specialty_Summary'] = processed['specialty_summary']
-    
+
     # College summary
     download_data['College_Summary'] = processed['college_summary']
-    
+
     # Program summary
     download_data['Program_Summary'] = processed['program_summary']
-    
+
     # Specialty-Category breakdown
     download_data['Specialty_Category'] = processed['specialty_category']
-    
-    # Validation results
-    download_data['Validation'] = validation_df
-    
+
+    # Overall Validation results
+    download_data['Overall_Validation'] = validation_df
+
+    # Course-wise (specialty-wise) percentage validation
+    if coursewise_df is not None:
+        download_data['Coursewise_Validation'] = coursewise_df
+    if coursewise_summary is not None:
+        download_data['Coursewise_Summary'] = coursewise_summary
+
     # Pivot tables
     download_data['Specialty_Category_Pivot'] = processed['specialty_category_pivot'].reset_index()
     download_data['College_Category_Pivot'] = processed['college_category_pivot'].reset_index()
     download_data['College_Specialty_Pivot'] = processed['college_specialty_pivot'].reset_index()
-    
+
     return download_data
 
 def create_excel_download(download_data):
@@ -831,29 +906,29 @@ def main():
         st.session_state.data = None
     if 'processed' not in st.session_state:
         st.session_state.processed = None
-    
+
     st.title("🎓 Seat Allocation System")
     st.markdown("### View and Analyze Seat Allocation Data")
     st.divider()
-    
+
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuration")
-        
+
         # Data input
         st.subheader("📁 Data Input")
         input_type = st.radio(
             "Choose input method:",
             ["Sample Data", "Upload CSV", "Paste Data"]
         )
-        
+
         data = None
-        
+
         if input_type == "Sample Data":
             data = get_sample_data()
             st.success(f"✅ Loaded {len(data)} rows")
             st.dataframe(data.head(10), use_container_width=True)
-        
+
         elif input_type == "Upload CSV":
             uploaded = st.file_uploader("Upload CSV", type=['csv'])
             if uploaded:
@@ -863,7 +938,7 @@ def main():
                     st.dataframe(data.head(10), use_container_width=True)
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
-        
+
         else:  # Paste Data
             st.info("📝 Paste your CSV data below")
             text_data = st.text_area("CSV Data", height=200)
@@ -873,10 +948,10 @@ def main():
                     st.success(f"✅ Loaded {len(data)} rows")
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
-        
+
         if data is not None:
             st.session_state.data = data
-            
+
             # Process data
             if st.button("📊 Process Data", type="primary", use_container_width=True):
                 with st.spinner("Processing data..."):
@@ -884,12 +959,33 @@ def main():
                     st.session_state.processed = processed
                     st.success("✅ Data processed successfully!")
                     st.balloons()
-    
+
+        st.divider()
+        st.subheader("🎯 Course-wise Tolerance")
+        tolerance = st.slider(
+            "Allowed deviation (percentage points)",
+            min_value=0.5, max_value=10.0, value=2.0, step=0.5,
+            help="A category within a course is flagged if its actual % share deviates "
+                 "from the seat-matrix % by more than this many points. Categories that "
+                 "deserved at least ~half a seat but got zero are always flagged as 'Missing', "
+                 "regardless of tolerance."
+        )
+
     # Main content
     if st.session_state.processed is not None:
         processed = st.session_state.processed
         data = st.session_state.data
-        
+
+        # Overall (grand total) validation
+        validation_df = validate_allocations(data)
+
+        # Course-wise (specialty-wise) validation
+        coursewise_df = calculate_coursewise_compliance(data, tolerance_pts=tolerance)
+        coursewise_summary, fully_compliant, total_courses = summarize_coursewise_compliance(coursewise_df)
+
+        overall_ok = (validation_df['Difference'] == 0).all()
+        coursewise_ok = fully_compliant == total_courses
+
         # Metrics
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
@@ -902,16 +998,23 @@ def main():
             st.metric("Specialties", processed['total_specialties'])
         with col5:
             expected_total = sum(SEAT_MATRIX.values())
-            diff = processed['total_seats'] - expected_total
             st.metric(
-                "vs Expected", 
+                "vs Expected",
                 f"{processed['total_seats'] - expected_total:+d}",
                 delta_color="inverse"
             )
-        
-        # Validation
-        validation_df = validate_allocations(data)
-        
+
+        # Top-level compliance banner (overall AND course-wise)
+        if overall_ok and coursewise_ok:
+            st.success("✅ Overall totals match the seat matrix **and** every course individually satisfies the percentage criteria.")
+        else:
+            msgs = []
+            if not overall_ok:
+                msgs.append("overall grand-total category counts do not match the seat matrix")
+            if not coursewise_ok:
+                msgs.append(f"{total_courses - fully_compliant} of {total_courses} courses do not satisfy the course-wise percentage criteria")
+            st.error("⚠️ Compliance issue: " + " and ".join(msgs) + ". See the **Validation** and **Course-wise %** tabs for details.")
+
         # Tabs
         tabs = st.tabs([
             "📊 Summary",
@@ -919,41 +1022,42 @@ def main():
             "🏛️ Specialty Analysis",
             "📚 College Analysis",
             "🔍 Specialty-Category View",
-            "📋 Validation",
+            "📋 Validation (Overall)",
+            "🎯 Course-wise % (Per Course)",
             "📥 Download"
         ])
-        
+
         # Tab 1: Summary
         with tabs[0]:
             st.subheader("Summary Statistics")
-            
+
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 st.markdown("#### Category Summary")
                 st.dataframe(processed['category_summary'], use_container_width=True)
-                
+
                 st.markdown("#### Program Summary")
                 st.dataframe(processed['program_summary'], use_container_width=True)
-            
+
             with col2:
                 st.markdown("#### Top 10 Specialties")
                 st.dataframe(processed['specialty_summary'].head(10), use_container_width=True)
-                
+
                 st.markdown("#### Top 10 Colleges")
                 st.dataframe(processed['college_summary'].head(10), use_container_width=True)
-        
+
         # Tab 2: Category Analysis
         with tabs[1]:
             st.subheader("Category-wise Analysis")
-            
+
             # Category chart
             fig = create_category_chart(processed['category_summary'])
             st.plotly_chart(fig, use_container_width=True)
-            
+
             # Category breakdown table
             st.markdown("#### Detailed Category Breakdown by Specialty")
-            
+
             # Pivot table for categories
             cat_pivot = data.pivot_table(
                 index='Category',
@@ -963,30 +1067,30 @@ def main():
                 aggfunc='sum'
             )
             st.dataframe(cat_pivot, use_container_width=True)
-        
+
         # Tab 3: Specialty Analysis
         with tabs[2]:
             st.subheader("Specialty-wise Analysis")
-            
+
             # Specialty chart
             fig = create_specialty_chart(processed['specialty_summary'])
             st.plotly_chart(fig, use_container_width=True)
-            
+
             # CS Specialty details
             st.markdown("#### CS Specialty Details")
             cs_data = data[data['Specialty'] == 'CS']
             if not cs_data.empty:
                 cs_total = cs_data['Seats'].sum()
                 cs_by_category = cs_data.groupby('Category')['Seats'].sum().reset_index()
-                
+
                 col1, col2 = st.columns(2)
                 with col1:
                     st.metric("CS Total Seats", int(cs_total))
                 with col2:
                     st.metric("CS Categories", len(cs_by_category))
-                
+
                 st.dataframe(cs_by_category, use_container_width=True)
-                
+
                 # CS distribution pie chart
                 fig_cs = px.pie(
                     cs_by_category,
@@ -997,60 +1101,54 @@ def main():
                 st.plotly_chart(fig_cs, use_container_width=True)
             else:
                 st.warning("No data found for CS specialty")
-            
+
             # All specialty-category breakdown
             st.markdown("#### All Specialty-Category Breakdown")
             st.dataframe(processed['specialty_category'], use_container_width=True)
-        
+
         # Tab 4: College Analysis
         with tabs[3]:
             st.subheader("College-wise Analysis")
-            
+
             # College chart
             fig = create_college_chart(processed['college_summary'])
             st.plotly_chart(fig, use_container_width=True)
-            
+
             # College-Category breakdown
             st.markdown("#### College-Category Breakdown")
             st.dataframe(processed['college_category_pivot'], use_container_width=True)
-            
+
             # College-Specialty breakdown
             st.markdown("#### College-Specialty Breakdown")
             st.dataframe(processed['college_specialty_pivot'], use_container_width=True)
-        
+
         # Tab 5: Specialty-Category View
         with tabs[4]:
             st.subheader("Specialty vs Category Analysis")
-            
+
             # Heatmap
             fig = create_specialty_category_heatmap(data)
             st.plotly_chart(fig, use_container_width=True)
-            
+
             # Detailed pivot table
             st.markdown("#### Specialty-Category Pivot Table")
             st.dataframe(processed['specialty_category_pivot'], use_container_width=True)
-        
-        # Tab 6: Validation
+
+        # Tab 6: Validation (Overall)
         with tabs[5]:
-            st.subheader("Data Validation")
-            
+            st.subheader("Overall (Grand-Total) Validation")
+
             st.markdown("""
-            This section validates the allocation against the expected seat matrix:
-            - **SM**: 50 seats
-            - **EW**: 10 seats
-            - **EZ**: 9 seats
-            - **MU**: 8 seats
-            - **SC**: 8 seats
-            - **BH**: 3 seats
-            - **LA**: 3 seats
-            - **DV**: 2 seats
-            - **VK**: 2 seats
-            - **ST**: 2 seats
-            - **KN**: 1 seat
-            - **BX**: 1 seat
-            - **KU**: 1 seat
+            This checks the **grand total** allocation against the expected seat matrix:
+            - **SM**: 50 seats &nbsp;•&nbsp; **EW**: 10 seats &nbsp;•&nbsp; **EZ**: 9 seats &nbsp;•&nbsp;
+              **MU**: 8 seats &nbsp;•&nbsp; **SC**: 8 seats &nbsp;•&nbsp; **BH**: 3 seats &nbsp;•&nbsp;
+              **LA**: 3 seats &nbsp;•&nbsp; **DV**: 2 seats &nbsp;•&nbsp; **VK**: 2 seats &nbsp;•&nbsp;
+              **ST**: 2 seats &nbsp;•&nbsp; **KN**: 1 seat &nbsp;•&nbsp; **BX**: 1 seat &nbsp;•&nbsp; **KU**: 1 seat
+
+            ⚠️ Note: matching the overall total does **not** guarantee that each individual
+            course/specialty respects these percentages — see the **Course-wise %** tab for that check.
             """)
-            
+
             # Display validation results
             st.dataframe(
                 validation_df,
@@ -1063,15 +1161,15 @@ def main():
                 },
                 use_container_width=True
             )
-            
+
             # Show validation summary
             all_match = (validation_df['Difference'] == 0).all()
-            
+
             if all_match:
-                st.success("✅ All allocations match the expected seat matrix exactly!")
+                st.success("✅ All allocations match the expected seat matrix exactly (overall)!")
             else:
-                st.warning("⚠️ Some allocations differ from the expected seat matrix")
-                
+                st.warning("⚠️ Some allocations differ from the expected seat matrix (overall)")
+
                 # Show mismatches
                 mismatches = validation_df[validation_df['Difference'] != 0]
                 if not mismatches.empty:
@@ -1080,29 +1178,108 @@ def main():
                         mismatches[['Category', 'Expected', 'Actual', 'Difference']],
                         use_container_width=True
                     )
-        
-        # Tab 7: Download
+
+        # Tab 7: Course-wise Percentage Validation
         with tabs[6]:
+            st.subheader("Course-wise (Per-Specialty) Percentage Validation")
+            st.markdown("""
+            The seat-matrix percentages must be satisfied **within each course/specialty individually**,
+            not just in the grand total. For every specialty, expected seats per category =
+            `course_total × matrix_% / 100`. A category is flagged **Missing** if it deserved at
+            least ~half a seat but got zero, or **⚠️** if its actual share deviates from the
+            expected share by more than the tolerance set in the sidebar (currently **{:.1f} pts**).
+            """.format(tolerance))
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Courses", total_courses)
+            with col2:
+                st.metric("Fully Compliant", fully_compliant)
+            with col3:
+                st.metric("Courses w/ Violations", total_courses - fully_compliant)
+            with col4:
+                total_missing = int((coursewise_df['Status'] == 'Missing').sum())
+                st.metric("Missing-Category Instances", total_missing)
+
+            st.markdown("#### Compliance by Course")
+            st.dataframe(
+                coursewise_summary.rename(columns={
+                    'Course_Total': 'Total Seats',
+                    'Category_Violations': 'Category Violations',
+                    'Missing_Mandatory_Categories': 'Missing Mandatory Categories'
+                }),
+                use_container_width=True
+            )
+
+            st.markdown("#### Detailed Category-Level Breakdown")
+            filter_option = st.radio(
+                "Show:",
+                ["All", "Only Violations (⚠️ + Missing)", "Only Missing Mandatory"],
+                horizontal=True
+            )
+
+            display_df = coursewise_df.copy()
+            if filter_option == "Only Violations (⚠️ + Missing)":
+                display_df = display_df[display_df['Status'] != '✅']
+            elif filter_option == "Only Missing Mandatory":
+                display_df = display_df[display_df['Status'] == 'Missing']
+
+            st.dataframe(display_df, use_container_width=True, height=400)
+
+            # Heatmap of deviation
+            st.markdown("#### Deviation Heatmap (Actual % − Expected %)")
+            deviation_pivot = coursewise_df.pivot_table(
+                index='Specialty', columns='Category', values='Deviation (pts)', fill_value=0
+            )
+            specialty_order = data.groupby('Specialty')['Seats'].sum().sort_values(ascending=False).index
+            deviation_pivot = deviation_pivot.loc[[s for s in specialty_order if s in deviation_pivot.index]]
+
+            fig_dev = px.imshow(
+                deviation_pivot,
+                title='Percentage-Point Deviation by Course & Category',
+                color_continuous_scale='RdBu_r',
+                color_continuous_midpoint=0,
+                text_auto='.1f',
+                aspect='auto',
+                height=max(400, len(deviation_pivot.index) * 25)
+            )
+            fig_dev.update_layout(xaxis_title='Category', yaxis_title='Specialty')
+            st.plotly_chart(fig_dev, use_container_width=True)
+
+            if fully_compliant < total_courses:
+                st.warning(
+                    f"⚠️ {total_courses - fully_compliant} out of {total_courses} courses do not satisfy "
+                    f"the course-wise percentage criteria within the {tolerance} pt tolerance."
+                )
+            else:
+                st.success("✅ All courses satisfy the course-wise percentage criteria!")
+
+        # Tab 8: Download
+        with tabs[7]:
             st.subheader("📥 Download Results")
-            
+
             st.markdown("Download the data in various formats:")
-            
-            # Create download data
-            download_data = create_download_data(data, processed, validation_df)
-            
+
+            # Create download data (now includes both overall AND course-wise validation)
+            download_data = create_download_data(
+                data, processed, validation_df,
+                coursewise_df=coursewise_df,
+                coursewise_summary=coursewise_summary
+            )
+
             # Excel download
             st.markdown("#### Download as Excel")
             excel_bytes = create_excel_download(download_data)
             st.download_button(
-                "📥 Download Full Report (Excel)",
+                "📥 Download Full Report (Excel, incl. Course-wise Validation)",
                 excel_bytes,
                 f"seat_allocation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
-            
+
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 st.markdown("#### Download Original Data")
                 csv = data.to_csv(index=False)
@@ -1113,21 +1290,26 @@ def main():
                     "text/csv",
                     use_container_width=True
                 )
-            
+
             with col2:
                 st.markdown("#### Download as JSON")
                 json_data = {
                     'timestamp': datetime.now().isoformat(),
                     'seat_matrix': SEAT_MATRIX,
                     'total_seats': int(processed['total_seats']),
+                    'coursewise_tolerance_pts': tolerance,
+                    'coursewise_fully_compliant_courses': fully_compliant,
+                    'coursewise_total_courses': total_courses,
                     'summary': {
                         'category_summary': processed['category_summary'].to_dict('records'),
                         'specialty_summary': processed['specialty_summary'].to_dict('records'),
                         'college_summary': processed['college_summary'].to_dict('records')
                     },
+                    'overall_validation': validation_df.to_dict('records'),
+                    'coursewise_validation': coursewise_df.to_dict('records'),
                     'data': data.to_dict('records')
                 }
-                
+
                 # Convert numpy types to Python native types
                 def convert_to_serializable(obj):
                     if isinstance(obj, np.integer):
@@ -1142,10 +1324,10 @@ def main():
                         return [convert_to_serializable(item) for item in obj]
                     else:
                         return obj
-                
+
                 json_data = convert_to_serializable(json_data)
                 json_str = json.dumps(json_data, indent=2)
-                
+
                 st.download_button(
                     "📥 Download as JSON",
                     json_str,
@@ -1153,11 +1335,11 @@ def main():
                     "application/json",
                     use_container_width=True
                 )
-            
+
             # Download individual sheets
             st.markdown("#### Download Individual Reports")
             cols = st.columns(3)
-            
+
             with cols[0]:
                 # Category Summary
                 csv_cat = processed['category_summary'].to_csv(index=False)
@@ -1168,7 +1350,7 @@ def main():
                     "text/csv",
                     use_container_width=True
                 )
-            
+
             with cols[1]:
                 # Specialty Summary
                 csv_spec = processed['specialty_summary'].to_csv(index=False)
@@ -1179,7 +1361,7 @@ def main():
                     "text/csv",
                     use_container_width=True
                 )
-            
+
             with cols[2]:
                 # College Summary
                 csv_col = processed['college_summary'].to_csv(index=False)
@@ -1190,21 +1372,32 @@ def main():
                     "text/csv",
                     use_container_width=True
                 )
-            
+
             cols2 = st.columns(3)
-            
+
             with cols2[0]:
-                # Validation Report
+                # Overall Validation Report
                 csv_val = validation_df.to_csv(index=False)
                 st.download_button(
-                    "📥 Validation Report",
+                    "📥 Overall Validation Report",
                     csv_val,
-                    f"validation_report_{datetime.now().strftime('%Y%m%d')}.csv",
+                    f"overall_validation_report_{datetime.now().strftime('%Y%m%d')}.csv",
                     "text/csv",
                     use_container_width=True
                 )
-            
+
             with cols2[1]:
+                # Course-wise Validation Report
+                csv_cw = coursewise_df.to_csv(index=False)
+                st.download_button(
+                    "📥 Course-wise Validation Report",
+                    csv_cw,
+                    f"coursewise_validation_report_{datetime.now().strftime('%Y%m%d')}.csv",
+                    "text/csv",
+                    use_container_width=True
+                )
+
+            with cols2[2]:
                 # Specialty-Category Pivot
                 csv_sc = processed['specialty_category_pivot'].reset_index().to_csv(index=False)
                 st.download_button(
@@ -1214,32 +1407,21 @@ def main():
                     "text/csv",
                     use_container_width=True
                 )
-            
-            with cols2[2]:
-                # College-Category Pivot
-                csv_cc = processed['college_category_pivot'].reset_index().to_csv(index=False)
-                st.download_button(
-                    "📥 College-Category Pivot",
-                    csv_cc,
-                    f"college_category_pivot_{datetime.now().strftime('%Y%m%d')}.csv",
-                    "text/csv",
-                    use_container_width=True
-                )
-    
+
     else:
         # Welcome message
         st.info("👈 Load your data in the sidebar and click 'Process Data'")
-        
+
         st.markdown("""
         ### 📋 How to Use This Application
-        
+
         1. **Load Data**: Upload a CSV file or use sample data
         2. **Process**: Click 'Process Data' to analyze
         3. **Explore**: View results across multiple tabs
         4. **Export**: Download results in CSV, Excel, or JSON format
-        
+
         ### 📁 Required Data Format
-        
+
         Your CSV should have these columns:
         - **Program**: Program code (e.g., E)
         - **Specialty**: Specialty name (e.g., CS, ME, EC)
@@ -1247,22 +1429,30 @@ def main():
         - **Type**: Type (e.g., G)
         - **Category**: Seat category (SM, EW, EZ, etc.)
         - **Seats**: Number of seats
-        
-        ### 🎯 Expected Seat Matrix
-        
-        - **SM**: 50 seats
-        - **EW**: 10 seats
-        - **EZ**: 9 seats
-        - **MU**: 8 seats
-        - **SC**: 8 seats
-        - **BH**: 3 seats
-        - **LA**: 3 seats
-        - **DV**: 2 seats
-        - **VK**: 2 seats
-        - **ST**: 2 seats
-        - **KN**: 1 seat
-        - **BX**: 1 seat
-        - **KU**: 1 seat
+
+        ### 🎯 Expected Seat Matrix (also the target % per category)
+
+        - **SM**: 50 seats (50%)
+        - **EW**: 10 seats (10%)
+        - **EZ**: 9 seats (9%)
+        - **MU**: 8 seats (8%)
+        - **SC**: 8 seats (8%)
+        - **BH**: 3 seats (3%)
+        - **LA**: 3 seats (3%)
+        - **DV**: 2 seats (2%)
+        - **VK**: 2 seats (2%)
+        - **ST**: 2 seats (2%)
+        - **KN**: 1 seat (1%)
+        - **BX**: 1 seat (1%)
+        - **KU**: 1 seat (1%)
+
+        ### ✅ Two Levels of Validation
+
+        This app checks compliance at **two** levels:
+        1. **Overall** — do the grand totals across all courses match the seat matrix counts? (Validation tab)
+        2. **Course-wise** — does *each individual course/specialty* also respect these percentages,
+           within an adjustable tolerance? (Course-wise % tab) — a course can pass #1 while badly
+           failing #2, e.g. one course over-allocating EW/EZ while giving zero seats to VK/KN/DV.
         """)
 
 # ============================================================================
