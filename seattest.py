@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import json
 from datetime import datetime
+from io import StringIO
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -17,392 +18,733 @@ st.set_page_config(
 )
 
 # ============================================================================
-# SEAT ALLOCATOR CLASS
+# CONSTANTS
 # ============================================================================
 
-class SeatAllocator:
-    def __init__(self, college_data, seat_matrix=None):
-        """
-        Initialize with college data and optional seat matrix
-        
-        Args:
-            college_data: DataFrame with columns ['Program', 'Specialty', 'College', 'Seats', 'Type']
-            seat_matrix: Dictionary of category to seat allocation (optional)
-        """
-        self.college_data = college_data.copy()
-        
-        # If seat_matrix not provided, create from data
-        if seat_matrix is None:
-            # Get all unique categories from data
-            categories = self.college_data['Program'].unique()
-            # Calculate seats per category based on total seats
-            category_counts = self.college_data.groupby('Program')['Seats'].sum().to_dict()
-            self.seat_matrix = category_counts
-        else:
-            self.seat_matrix = seat_matrix
-        
-        self.categories = list(self.seat_matrix.keys())
-        self.total_seats = sum(self.seat_matrix.values())
-        
-        # Store total seats from input for validation
-        self.input_total_seats = self.college_data['Seats'].sum()
-    
-    def hamilton_rounding(self, proportions, total_seats):
-        """Hamilton (largest remainder) method"""
-        proportions = np.array(proportions)
-        if len(proportions) == 0 or total_seats <= 0:
-            return np.zeros(len(proportions), dtype=int)
-        
-        # Calculate initial seats
-        initial_seats = np.floor(proportions * total_seats).astype(int)
-        remainder = proportions * total_seats - initial_seats
-        
-        # Distribute remaining seats
-        remaining = total_seats - initial_seats.sum()
-        if remaining > 0:
-            idx = np.argsort(remainder)[::-1][:int(remaining)]
-            initial_seats[idx] += 1
-        
-        return initial_seats
-    
-    def biproportional_allocation(self, row_margins, col_margins, max_iter=100):
-        """Biproportional allocation"""
-        n_rows, n_cols = len(row_margins), len(col_margins)
-        if n_rows == 0 or n_cols == 0:
-            return np.zeros((n_rows, n_cols), dtype=int)
-        
-        # Initialize matrix
-        matrix = np.ones((n_rows, n_cols))
-        
-        # Iterative proportional fitting
-        for _ in range(max_iter):
-            # Scale rows
-            row_sums = matrix.sum(axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1
-            matrix = matrix * (row_margins.reshape(-1, 1) / row_sums)
-            
-            # Scale columns
-            col_sums = matrix.sum(axis=0, keepdims=True)
-            col_sums[col_sums == 0] = 1
-            matrix = matrix * (col_margins.reshape(1, -1) / col_sums)
-        
-        # Round to integers
-        rounded = np.zeros((n_rows, n_cols), dtype=int)
-        for i in range(n_rows):
-            if matrix[i, :].sum() > 0:
-                rounded[i, :] = self.hamilton_rounding(
-                    matrix[i, :] / matrix[i, :].sum(),
-                    int(row_margins[i])
-                )
-        
-        return rounded
-    
-    def calculate_allocations(self):
-        """Main allocation function"""
-        colleges = self.college_data['College'].unique()
-        specialties = self.college_data['Specialty'].unique()
-        
-        # Create mapping
-        seat_map = {}
-        for _, row in self.college_data.iterrows():
-            key = (row['College'], row['Specialty'])
-            seat_map[key] = row['Seats']
-        
-        n_colleges = len(colleges)
-        n_specialties = len(specialties)
-        
-        # Calculate margins
-        college_seats = np.array([
-            sum(seat_map.get((c, s), 0) for s in specialties)
-            for c in colleges
-        ])
-        
-        specialty_seats = np.array([
-            sum(seat_map.get((c, s), 0) for c in colleges)
-            for s in specialties
-        ])
-        
-        # Total seats from data
-        total_data_seats = sum(college_seats)
-        
-        # Calculate category shares based on seat matrix
-        category_shares = np.array(list(self.seat_matrix.values())) / self.total_seats
-        # Scale to match total data seats
-        category_shares = category_shares * total_data_seats / category_shares.sum()
-        
-        results = {'hamilton': {}, 'biproportional': {}}
-        
-        for idx, category in enumerate(self.categories):
-            # Calculate category total based on proportion of total
-            cat_total = int(self.seat_matrix[category])
-            
-            # Get proportions for Hamilton
-            props = []
-            for c in colleges:
-                for s in specialties:
-                    props.append(seat_map.get((c, s), 0))
-            props = np.array(props)
-            
-            if props.sum() > 0:
-                ham_alloc = self.hamilton_rounding(props / props.sum(), cat_total)
-            else:
-                ham_alloc = np.zeros(len(props))
-            
-            ham_matrix = ham_alloc.reshape(n_colleges, n_specialties)
-            
-            # Biproportional
-            if n_colleges > 0 and n_specialties > 0:
-                row_marg = college_seats * (cat_total / total_data_seats)
-                col_marg = specialty_seats * (cat_total / total_data_seats)
-                
-                # Ensure margins sum correctly
-                row_marg = np.round(row_marg).astype(int)
-                col_marg = np.round(col_marg).astype(int)
-                
-                # Adjust margins to match category total
-                while row_marg.sum() != cat_total and cat_total > 0:
-                    if row_marg.sum() < cat_total:
-                        row_marg[np.argmax(college_seats)] += 1
-                    else:
-                        row_marg[np.argmin(college_seats)] -= 1
-                
-                while col_marg.sum() != cat_total and cat_total > 0:
-                    if col_marg.sum() < cat_total:
-                        col_marg[np.argmax(specialty_seats)] += 1
-                    else:
-                        col_marg[np.argmin(specialty_seats)] -= 1
-                
-                bipro_matrix = self.biproportional_allocation(row_marg, col_marg)
-            else:
-                bipro_matrix = np.zeros((n_colleges, n_specialties), dtype=int)
-            
-            results['hamilton'][category] = ham_matrix
-            results['biproportional'][category] = bipro_matrix
-        
-        return results, colleges, specialties
+# Original seat matrix from the problem
+SEAT_MATRIX = {
+    'SM': 50, 'EW': 10, 'EZ': 9, 'MU': 8, 'SC': 8, 
+    'BH': 3, 'LA': 3, 'DV': 2, 'VK': 2, 'ST': 2, 
+    'KN': 1, 'BX': 1, 'KU': 1
+}
 
 # ============================================================================
-# UI FUNCTIONS
+# DATA PROCESSING FUNCTIONS
+# ============================================================================
+
+def process_allocated_data(data):
+    """
+    Process the allocated data to show summary statistics
+    """
+    # Summary by Category
+    category_summary = data.groupby('Category')['Seats'].sum().reset_index()
+    category_summary['Expected'] = category_summary['Category'].map(SEAT_MATRIX)
+    category_summary['Difference'] = category_summary['Seats'] - category_summary['Expected']
+    category_summary['Accuracy'] = (category_summary['Seats'] / category_summary['Expected'] * 100).round(1)
+    
+    # Summary by College
+    college_summary = data.groupby('College')['Seats'].sum().reset_index()
+    college_summary = college_summary.sort_values('Seats', ascending=False)
+    
+    # Summary by Specialty
+    specialty_summary = data.groupby('Specialty')['Seats'].sum().reset_index()
+    specialty_summary = specialty_summary.sort_values('Seats', ascending=False)
+    
+    # Summary by Program
+    program_summary = data.groupby('Program')['Seats'].sum().reset_index()
+    
+    # College-Specialty-Category breakdown
+    pivot_csc = data.pivot_table(
+        index=['College', 'Specialty'],
+        columns='Category',
+        values='Seats',
+        fill_value=0
+    ).reset_index()
+    
+    return {
+        'category_summary': category_summary,
+        'college_summary': college_summary,
+        'specialty_summary': specialty_summary,
+        'program_summary': program_summary,
+        'pivot_csc': pivot_csc,
+        'total_seats': data['Seats'].sum(),
+        'total_categories': len(data['Category'].unique()),
+        'total_colleges': len(data['College'].unique()),
+        'total_specialties': len(data['Specialty'].unique())
+    }
+
+def validate_allocations(data):
+    """
+    Validate that allocations match the seat matrix
+    """
+    validation_results = []
+    
+    # Check each category
+    for category, expected in SEAT_MATRIX.items():
+        actual = data[data['Category'] == category]['Seats'].sum()
+        status = '✅' if actual == expected else '⚠️'
+        validation_results.append({
+            'Category': category,
+            'Expected': expected,
+            'Actual': int(actual),
+            'Difference': int(actual - expected),
+            'Status': status
+        })
+    
+    # Check total
+    total_actual = data['Seats'].sum()
+    total_expected = sum(SEAT_MATRIX.values())
+    status = '✅' if total_actual == total_expected else '⚠️'
+    validation_results.append({
+        'Category': 'TOTAL',
+        'Expected': total_expected,
+        'Actual': int(total_actual),
+        'Difference': int(total_actual - total_expected),
+        'Status': status
+    })
+    
+    return pd.DataFrame(validation_results)
+
+# ============================================================================
+# SAMPLE DATA
 # ============================================================================
 
 def get_sample_data():
-    """Return sample data"""
-    return pd.DataFrame({
-        'Program': ['E', 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E', 'E'],
-        'Specialty': ['DS', 'DS', 'DS', 'AI', 'AI', 'CS', 'CS', 'CS', 'ML', 'ML', 'DS', 'AI'],
-        'College': ['CDI', 'CDP', 'CDT', 'CDI', 'CDP', 'CDT', 'CDI', 'CDP', 'CDT', 'CDI', 'CDP', 'CDT'],
-        'Seats': [1, 1, 4, 2, 3, 1, 2, 1, 2, 1, 1, 2],
-        'Type': ['G'] * 12
-    })
+    """Create sample data with the format you provided"""
+    data = """Program,Specialty,College,Type,Category,Seats
+E,CU,KSD,G,SM,2
+E,CU,KSD,G,BH,1
+E,CU,MDL,G,SM,2
+E,CU,MDL,G,BH,1
+E,CU,PRP,G,SM,2
+E,CU,PRP,G,BH,1
+E,ID,KSD,G,SM,1
+E,ID,KSD,G,ST,1
+E,ID,KSD,G,BH,1
+E,ES,LBT,G,SM,1
+E,ES,LBT,G,BH,1
+E,ES,LBT,G,VK,1
+E,ES,PRN,G,SM,1
+E,ES,PRN,G,EZ,1
+E,ES,PRN,G,BH,1
+E,ES,TLY,G,SM,1
+E,ES,TLY,G,BH,1
+E,ES,TLY,G,LA,1
+E,AD,CEC,G,SM,1
+E,AD,CEC,G,BH,1
+E,AD,CEC,G,VK,1
+E,AD,KNP,G,SM,1
+E,AD,KNP,G,BH,1
+E,AD,KNP,G,DV,1
+E,AD,LBT,G,SM,1
+E,AD,LBT,G,ST,1
+E,AD,LBT,G,BH,1
+E,AD,PRN,G,SM,1
+E,AD,PRN,G,BH,1
+E,AD,PRN,G,VK,1
+E,AD,UCE,G,SM,1
+E,AD,UCE,G,BH,1
+E,AD,UCE,G,LA,1
+E,CL,CEA,G,SM,2
+E,CL,CEA,G,BH,1
+E,CL,CEK,G,SM,2
+E,CL,CEK,G,LA,1
+E,CL,CHN,G,SM,2
+E,CL,CHN,G,LA,1
+E,CL,SCT,G,SM,1
+E,CL,SCT,G,BX,1
+E,CV,WYD,G,SM,1
+E,CV,WYD,G,KN,1
+E,CO,ADR,G,SM,2
+E,CO,ADR,G,BH,1
+E,CO,TKR,G,SM,1
+E,EB,MDL,G,SM,2
+E,EB,MDL,G,VK,1
+E,EV,MDL,G,SM,2
+E,EV,MDL,G,DV,1
+E,EP,UCC,G,SM,1
+E,PT,UCC,G,SM,1
+E,PO,UCE,G,SM,2
+E,PO,UCE,G,BH,1
+E,CT,TKR,G,SM,1
+E,MA,SCT,G,SM,1
+E,MA,SCT,G,ST,1
+E,MA,SCT,G,LA,1
+E,CY,PTA,G,SM,1
+E,CY,PTA,G,ST,1
+E,CY,PTA,G,LA,1
+E,CY,UCE,G,SM,1
+E,CY,UCE,G,ST,1
+E,CY,UCE,G,LA,1
+E,BB,SCT,G,SM,1
+E,BB,SCT,G,DV,1
+E,BB,SCT,G,VK,1
+E,IE,TVE,G,SM,1
+E,IE,TVE,G,EZ,1
+E,IE,TVE,G,VK,1
+E,PE,TCR,G,SM,2
+E,PE,TCR,G,EW,1
+E,PE,TCR,G,EZ,1
+E,IT,IDK,G,SM,2
+E,IT,IDK,G,EW,1
+E,IT,IDK,G,EZ,1
+E,IT,PKD,G,SM,2
+E,IT,PKD,G,EW,1
+E,IT,PKD,G,EZ,1
+E,IT,PKD,G,MU,1
+E,IT,TRV,G,SM,1
+E,IT,TRV,G,KN,1
+E,IT,KSD,G,SM,1
+E,IT,KSD,G,DV,1
+E,IT,KSD,G,VK,1
+E,IT,LBT,G,SM,1
+E,IT,LBT,G,ST,1
+E,IT,LBT,G,LA,1
+E,IT,TLY,G,SM,2
+E,IT,TLY,G,LA,1
+E,IT,UCK,G,SM,2
+E,IT,UCK,G,EW,1
+E,IT,VDA,G,SM,2
+E,IT,VDA,G,LA,1
+E,ME,IDK,G,SM,2
+E,ME,IDK,G,EW,1
+E,ME,KKE,G,SM,2
+E,ME,KKE,G,EW,1
+E,ME,KNR,G,SM,2
+E,ME,KNR,G,EZ,1
+E,ME,KTE,G,SM,2
+E,ME,KTE,G,EW,1
+E,ME,NSS,G,SM,3
+E,ME,NSS,G,EW,1
+E,ME,NSS,G,EZ,1
+E,ME,PKD,G,SM,2
+E,ME,PKD,G,LA,1
+E,ME,TCR,G,SM,3
+E,ME,TCR,G,EW,1
+E,ME,TCR,G,EZ,1
+E,ME,TRV,G,SM,1
+E,ME,TRV,G,DV,1
+E,ME,TRV,G,VK,1
+E,ME,TVE,G,SM,2
+E,ME,TVE,G,EW,1
+E,ME,TVE,G,EZ,1
+E,ME,WYD,G,SM,1
+E,ME,WYD,G,DV,1
+E,ME,WYD,G,VK,1
+E,ME,ADR,G,SM,1
+E,ME,ADR,G,ST,1
+E,ME,ADR,G,DV,1
+E,ME,CEM,G,SM,1
+E,ME,CEM,G,EW,1
+E,ME,CEM,G,LA,1
+E,ME,KNP,G,KN,1
+E,ME,KSD,G,SM,1
+E,ME,KSD,G,EW,1
+E,ME,KSD,G,VK,1
+E,ME,MDL,G,SM,2
+E,ME,MDL,G,LA,1
+E,ME,MNR,G,SM,1
+E,ME,MNR,G,SC,1
+E,ME,MNR,G,MU,1
+E,ME,PEC,G,SM,2
+E,ME,PEC,G,SC,1
+E,ME,PRN,G,SM,1
+E,ME,PRN,G,EW,1
+E,ME,PRN,G,MU,1
+E,ME,PRP,G,SM,1
+E,ME,PRP,G,EW,1
+E,ME,PRP,G,SC,1
+E,ME,SCT,G,SM,3
+E,ME,SCT,G,EW,1
+E,ME,SCT,G,SC,1
+E,ME,SCT,G,EZ,1
+E,ME,TLY,G,SM,1
+E,ME,TLY,G,SC,1
+E,ME,TLY,G,MU,1
+E,ME,UCC,G,SM,1
+E,ME,UCC,G,SC,1
+E,ME,UCC,G,DV,1
+E,RA,IDK,G,SM,1
+E,RA,IDK,G,KN,1
+E,RA,KTE,G,SM,1
+E,RA,KTE,G,BX,1
+E,EE,IDK,G,SM,2
+E,EE,IDK,G,EZ,1
+E,EE,KNR,G,SM,2
+E,EE,KNR,G,SC,1
+E,EE,KTE,G,SM,2
+E,EE,KTE,G,SC,1
+E,EE,NSS,G,SM,3
+E,EE,NSS,G,EW,1
+E,EE,NSS,G,EZ,1
+E,EE,PKD,G,SM,2
+E,EE,PKD,G,EZ,1
+E,EE,TCR,G,SM,3
+E,EE,TCR,G,EW,1
+E,EE,TCR,G,EZ,1
+E,EE,TRV,G,SM,2
+E,EE,TRV,G,EW,1
+E,EE,TVE,G,SM,3
+E,EE,TVE,G,EW,1
+E,EE,TVE,G,EZ,1
+E,EE,WYD,G,SM,2
+E,EE,WYD,G,EW,1
+E,EE,ADR,G,SM,2
+E,EE,ADR,G,EW,1
+E,EE,CEA,G,SM,2
+E,EE,CEA,G,MU,1
+E,EE,CEC,G,KU,1
+E,EE,CEM,G,SM,1
+E,EE,CEM,G,SC,1
+E,EE,CEM,G,MU,1
+E,EE,CHN,G,SM,1
+E,EE,CHN,G,SC,1
+E,EE,CHN,G,MU,1
+E,EE,KGR,G,KU,1
+E,EE,KSD,G,SM,1
+E,EE,KSD,G,SC,1
+E,EE,KSD,G,MU,1
+E,EE,MDL,G,SM,1
+E,EE,MDL,G,EW,1
+E,EE,MDL,G,SC,1
+E,EE,MNR,G,SM,1
+E,EE,MNR,G,SC,1
+E,EE,MNR,G,MU,1
+E,EE,PEC,G,SM,1
+E,EE,PEC,G,SC,1
+E,EE,PEC,G,MU,1
+E,EE,PRN,G,SM,1
+E,EE,PRN,G,SC,1
+E,EE,PRN,G,EZ,1
+E,EE,PRP,G,KU,1
+E,EE,PTA,G,KU,1
+E,EE,TKR,G,SM,1
+E,EE,TKR,G,SC,1
+E,EE,TKR,G,MU,1
+E,EE,TLY,G,SM,1
+E,EE,TLY,G,SC,1
+E,EE,TLY,G,MU,1
+E,EE,UCC,G,SM,1
+E,EE,UCC,G,SC,1
+E,EE,UCC,G,MU,1
+E,EE,UCE,G,SM,1
+E,EE,UCE,G,SC,1
+E,EE,UCE,G,MU,1
+E,EE,VDA,G,SM,2
+E,EE,VDA,G,SC,1
+E,EC,IDK,G,SM,2
+E,EC,IDK,G,EW,1
+E,EC,IDK,G,EZ,1
+E,EC,KKE,G,SM,2
+E,EC,KKE,G,SC,1
+E,EC,KNR,G,SM,2
+E,EC,KNR,G,MU,1
+E,EC,KTE,G,SM,1
+E,EC,NSS,G,SM,3
+E,EC,NSS,G,EW,1
+E,EC,NSS,G,EZ,1
+E,EC,PKD,G,SM,2
+E,EC,PKD,G,MU,1
+E,EC,TCR,G,SM,3
+E,EC,TCR,G,EW,1
+E,EC,TCR,G,EZ,1
+E,EC,TRV,G,SM,2
+E,EC,TRV,G,MU,1
+E,EC,TVE,G,SM,2
+E,EC,TVE,G,EZ,1
+E,EC,WYD,G,SM,3
+E,EC,WYD,G,EW,1
+E,EC,WYD,G,SC,1
+E,EC,WYD,G,EZ,1
+E,EC,WYD,G,MU,1
+E,EC,ADR,G,SM,2
+E,EC,ADR,G,SC,1
+E,EC,AEC,G,SM,2
+E,EC,AEC,G,MU,1
+E,EC,CEA,G,SM,2
+E,EC,CEA,G,MU,1
+E,EC,CEC,G,SM,2
+E,EC,CEC,G,EZ,1
+E,EC,CEM,G,SM,2
+E,EC,CEM,G,MU,1
+E,EC,CHN,G,SM,3
+E,EC,CHN,G,EW,1
+E,EC,CHN,G,SC,1
+E,EC,CHN,G,EZ,1
+E,EC,KGR,G,SM,3
+E,EC,KGR,G,EW,1
+E,EC,KGR,G,EZ,1
+E,EC,KGR,G,MU,1
+E,EC,KNP,G,SM,1
+E,EC,KNP,G,SC,1
+E,EC,KNP,G,MU,1
+E,EC,KSD,G,SM,1
+E,EC,KSD,G,SC,1
+E,EC,KSD,G,MU,1
+E,EC,LBT,G,SM,2
+E,EC,LBT,G,MU,1
+E,EC,MDL,G,SM,3
+E,EC,MDL,G,EW,1
+E,EC,MDL,G,SC,1
+E,EC,MDL,G,EZ,1
+E,EC,MNR,G,SM,1
+E,EC,MNR,G,SC,1
+E,EC,MNR,G,MU,1
+E,EC,PEC,G,SM,1
+E,EC,PEC,G,SC,1
+E,EC,PEC,G,MU,1
+E,EC,PJR,G,KN,1
+E,EC,PRN,G,SM,3
+E,EC,PRN,G,EW,1
+E,EC,PRN,G,EZ,1
+E,EC,PRN,G,MU,1
+E,EC,PRP,G,SM,2
+E,EC,PRP,G,SC,1
+E,EC,PTA,G,SM,2
+E,EC,PTA,G,MU,1
+E,EC,SCT,G,SM,3
+E,EC,SCT,G,EW,1
+E,EC,SCT,G,SC,1
+E,EC,SCT,G,EZ,1
+E,EC,TKR,G,SM,2
+E,EC,TKR,G,EW,1
+E,EC,TKR,G,EZ,1
+E,EC,TLY,G,SM,3
+E,EC,TLY,G,EW,1
+E,EC,TLY,G,SC,1
+E,EC,TLY,G,EZ,1
+E,EC,UCC,G,SM,1
+E,EC,UCC,G,BX,1
+E,EC,UCE,G,SM,1
+E,EC,UCE,G,MU,1
+E,EC,UCE,G,BH,1
+E,EC,UCK,G,SM,2
+E,EC,UCK,G,ST,1
+E,EC,VDA,G,SM,2
+E,EC,VDA,G,MU,1
+E,FT,COU,G,SM,3
+E,FT,COU,G,EW,1
+E,FT,COU,G,SC,1
+E,FT,COU,G,EZ,1
+E,FT,COU,G,MU,1
+E,FT,KCT,G,SM,1
+E,FT,KCT,G,BX,1
+E,CS,IDK,G,SM,2
+E,CS,IDK,G,EW,1
+E,CS,IDK,G,EZ,1
+E,CS,KNR,G,KU,1
+E,CS,KTE,G,SM,2
+E,CS,KTE,G,SC,1
+E,CS,NSS,G,SM,3
+E,CS,NSS,G,EW,1
+E,CS,NSS,G,EZ,1
+E,CS,PKD,G,SM,1
+E,CS,PKD,G,ST,1
+E,CS,PKD,G,DV,1
+E,CS,TCR,G,BX,1
+E,CS,WYD,G,SM,2
+E,CS,WYD,G,ST,1
+E,CS,ADR,G,SM,3
+E,CS,ADR,G,EW,1
+E,CS,ADR,G,EZ,1
+E,CS,ADR,G,MU,1
+E,CS,AEC,G,SM,2
+E,CS,AEC,G,EW,1
+E,CS,CEA,G,SM,3
+E,CS,CEA,G,EW,1
+E,CS,CEA,G,SC,1
+E,CS,CEA,G,EZ,1
+E,CS,CEA,G,MU,1
+E,CS,CEC,G,SM,3
+E,CS,CEC,G,EW,1
+E,CS,CEC,G,EZ,1
+E,CS,CEC,G,MU,1
+E,CS,CEK,G,SM,3
+E,CS,CEK,G,EW,1
+E,CS,CEK,G,EZ,1
+E,CS,CEK,G,MU,1
+E,CS,CEM,G,SM,3
+E,CS,CEM,G,EW,1
+E,CS,CEM,G,SC,1
+E,CS,CEM,G,EZ,1
+E,CS,CHN,G,SM,5
+E,CS,CHN,G,EW,1
+E,CS,CHN,G,SC,1
+E,CS,CHN,G,EZ,1
+E,CS,CHN,G,MU,1
+E,CS,KGR,G,SM,3
+E,CS,KGR,G,EW,1
+E,CS,KGR,G,EZ,1
+E,CS,KGR,G,MU,1
+E,CS,KNP,G,SM,3
+E,CS,KNP,G,EW,1
+E,CS,KNP,G,EZ,1
+E,CS,KNP,G,MU,1
+E,CS,KSD,G,SM,3
+E,CS,KSD,G,EW,1
+E,CS,KSD,G,SC,1
+E,CS,KSD,G,EZ,1
+E,CS,KSD,G,MU,1
+E,CS,LBT,G,SM,4
+E,CS,LBT,G,EW,1
+E,CS,LBT,G,SC,1
+E,CS,LBT,G,EZ,1
+E,CS,LBT,G,MU,1
+E,CS,LBT,G,BH,1
+E,CS,MDL,G,SM,4
+E,CS,MDL,G,EW,1
+E,CS,MDL,G,SC,1
+E,CS,MDL,G,EZ,1
+E,CS,MDL,G,MU,1
+E,CS,MNR,G,SM,1
+E,CS,MNR,G,EW,1
+E,CS,MNR,G,LA,1
+E,CS,PEC,G,SM,1
+E,CS,PEC,G,SC,1
+E,CS,PEC,G,MU,1
+E,CS,PJR,G,SM,2
+E,CS,PJR,G,EW,1
+E,CS,PJR,G,EZ,1
+E,CS,PRN,G,SM,3
+E,CS,PRN,G,EW,1
+E,CS,PRN,G,SC,1
+E,CS,PRN,G,EZ,1
+E,CS,PRP,G,SM,3
+E,CS,PRP,G,EW,1
+E,CS,PRP,G,SC,1
+E,CS,PRP,G,EZ,1
+E,CS,PTA,G,SM,3
+E,CS,PTA,G,EW,1
+E,CS,PTA,G,EZ,1
+E,CS,PTA,G,MU,1
+E,CS,SCT,G,SM,3
+E,CS,SCT,G,EW,1
+E,CS,SCT,G,SC,1
+E,CS,SCT,G,EZ,1
+E,CS,TKR,G,SM,3
+E,CS,TKR,G,EW,1
+E,CS,TKR,G,SC,1
+E,CS,TKR,G,EZ,1
+E,CS,TLY,G,SM,3
+E,CS,TLY,G,EW,1
+E,CS,TLY,G,SC,1
+E,CS,TLY,G,EZ,1
+E,CS,UCC,G,SM,2
+E,CS,UCC,G,SC,1
+E,CS,UCE,G,SM,2
+E,CS,UCE,G,MU,1
+E,CS,UCK,G,SM,3
+E,CS,UCK,G,EW,1
+E,CS,UCK,G,EZ,1
+E,CS,UCK,G,MU,1
+E,CS,VDA,G,SM,2
+E,CS,VDA,G,MU,1
+E,AG,KCT,G,SM,2
+E,AG,KCT,G,EW,1
+E,AG,KCT,G,EZ,1
+E,AJ,KCT,G,SM,1
+E,AJ,KCT,G,KN,1
+E,EL,KKE,G,SM,1
+E,EL,KKE,G,DV,1
+E,EL,TVE,G,SM,1
+E,EL,TVE,G,KN,1
+E,EL,KGR,G,KN,1
+E,EL,PRP,G,BX,1
+E,IC,NSS,G,SM,1
+E,IC,NSS,G,EZ,1
+E,IC,NSS,G,MU,1
+E,CB,TCR,G,SM,1
+E,CB,TCR,G,BX,1
+E,CB,PTA,G,KU,1
+E,CH,KKE,G,SM,1
+E,CH,KKE,G,SC,1
+E,CH,KKE,G,MU,1
+E,CH,TCR,G,SM,3
+E,CH,TCR,G,EW,1
+E,CH,TCR,G,SC,1
+E,CH,TCR,G,EZ,1
+E,CG,KKE,G,SM,2
+E,CG,KKE,G,LA,1
+E,AE,KKE,G,SM,2
+E,AE,KKE,G,EW,1
+E,AE,KKE,G,EZ,1
+E,AE,TVE,G,SM,1
+E,AE,TVE,G,SC,1
+E,AE,TVE,G,MU,1
+E,CE,KKE,G,SM,1
+E,CE,KKE,G,SC,1
+E,CE,KKE,G,MU,1
+E,CE,KNR,G,SM,1
+E,CE,KNR,G,SC,1
+E,CE,KNR,G,MU,1
+E,CE,KTE,G,SM,3
+E,CE,KTE,G,EW,1
+E,CE,KTE,G,EZ,1
+E,CE,NSS,G,SM,2
+E,CE,NSS,G,EW,1
+E,CE,NSS,G,EZ,1
+E,CE,NSS,G,MU,1
+E,CE,PKD,G,SM,1
+E,CE,PKD,G,ST,1
+E,CE,PKD,G,LA,1
+E,CE,TCR,G,SM,3
+E,CE,TCR,G,EW,1
+E,CE,TCR,G,SC,1
+E,CE,TCR,G,EZ,1
+E,CE,TRV,G,SM,2
+E,CE,TRV,G,EW,1
+E,CE,TVE,G,SM,1
+E,CE,TVE,G,ST,1
+E,CE,TVE,G,VK,1
+E,CE,AEC,G,SM,1
+E,CE,AEC,G,EW,1
+E,CE,AEC,G,ST,1
+E,CE,CEM,G,SM,1
+E,CE,CEM,G,LA,1
+E,CE,CEM,G,DV,1
+E,CE,KGR,G,SM,1
+E,CE,KGR,G,BH,1
+E,CE,KGR,G,LA,1
+E,CE,KSD,G,SM,2
+E,CE,KSD,G,BH,1
+E,CE,LBT,G,SM,2
+E,CE,LBT,G,VK,1
+E,CE,PEC,G,SM,2
+E,CE,PEC,G,DV,1
+E,CE,PRP,G,SM,2
+E,CE,PRP,G,DV,1
+E,CE,TKR,G,SM,2
+E,CE,TKR,G,VK,1
+E,CE,TLY,G,SM,2
+E,CE,TLY,G,LA,1
+E,CE,VDA,G,SM,2
+E,CE,VDA,G,BH,1
+E,DS,CDI,G,KU,1
+E,DS,CDP,G,BX,1
+E,DS,CDT,G,SM,2
+E,DS,CDT,G,EW,1
+E,DS,CDT,G,EZ,1
+E,DS,CDV,G,SM,1"""
+    
+    df = pd.read_csv(StringIO(data))
+    return df
 
-def detect_seat_matrix_from_data(data):
-    """Auto-detect seat matrix from data"""
-    # Group by Program to get total seats per category
-    category_seats = data.groupby('Program')['Seats'].sum().to_dict()
-    return category_seats
+# ============================================================================
+# VISUALIZATION FUNCTIONS
+# ============================================================================
 
-def display_results(results, colleges, specialties, seat_matrix):
-    """Display allocation results"""
+def create_category_chart(summary_data):
+    """Create category distribution chart"""
+    fig = go.Figure()
     
-    # Summary cards
-    total_seats = sum(seat_matrix.values())
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Seats", total_seats)
-    with col2:
-        st.metric("Categories", len(seat_matrix))
-    with col3:
-        st.metric("Colleges", len(colleges))
-    with col4:
-        st.metric("Specialties", len(specialties))
+    fig.add_trace(go.Bar(
+        x=summary_data['Category'],
+        y=summary_data['Seats'],
+        name='Allocated',
+        marker_color='#2ca02c',
+        text=summary_data['Seats'],
+        textposition='outside'
+    ))
     
-    # Tabs
-    tabs = st.tabs(["📊 Hamilton Method", "📈 Biproportional Method", "📉 Comparison", "📋 Download"])
+    fig.add_trace(go.Bar(
+        x=summary_data['Category'],
+        y=summary_data['Expected'],
+        name='Expected',
+        marker_color='#1f77b4',
+        text=summary_data['Expected'],
+        textposition='outside'
+    ))
     
-    # Tab 1: Hamilton
-    with tabs[0]:
-        st.subheader("Hamilton Rounding Method")
-        st.info("Allocates seats using the largest remainder method")
-        
-        # Summary
-        summary = []
-        for cat, matrix in results['hamilton'].items():
-            total = matrix.sum()
-            expected = seat_matrix.get(cat, 0)
-            summary.append({
-                'Category': cat,
-                'Allocated': int(total),
-                'Expected': int(expected),
-                'Diff': int(total - expected),
-                'Accuracy': f"{(total/expected*100):.1f}%" if expected > 0 else "N/A"
-            })
-        st.dataframe(pd.DataFrame(summary), use_container_width=True)
-        
-        # Detailed matrices
-        with st.expander("📋 View Detailed Matrices"):
-            for cat, matrix in results['hamilton'].items():
-                st.write(f"**{cat}**")
-                df = pd.DataFrame(matrix, index=colleges, columns=specialties)
-                st.dataframe(df, use_container_width=True)
-                st.markdown("---")
+    fig.update_layout(
+        title='Category-wise Seat Allocation',
+        xaxis_title='Category',
+        yaxis_title='Number of Seats',
+        barmode='group',
+        height=400,
+        legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99)
+    )
     
-    # Tab 2: Biproportional
-    with tabs[1]:
-        st.subheader("Biproportional Method")
-        st.info("Balances allocation across both colleges and specialties")
-        
-        # Summary
-        summary = []
-        for cat, matrix in results['biproportional'].items():
-            total = matrix.sum()
-            expected = seat_matrix.get(cat, 0)
-            summary.append({
-                'Category': cat,
-                'Allocated': int(total),
-                'Expected': int(expected),
-                'Diff': int(total - expected),
-                'Accuracy': f"{(total/expected*100):.1f}%" if expected > 0 else "N/A"
-            })
-        st.dataframe(pd.DataFrame(summary), use_container_width=True)
-        
-        # Detailed matrices
-        with st.expander("📋 View Detailed Matrices"):
-            for cat, matrix in results['biproportional'].items():
-                st.write(f"**{cat}**")
-                df = pd.DataFrame(matrix, index=colleges, columns=specialties)
-                st.dataframe(df, use_container_width=True)
-                st.markdown("---")
+    return fig
+
+def create_college_chart(college_summary, top_n=20):
+    """Create college distribution chart"""
+    top_colleges = college_summary.head(top_n)
     
-    # Tab 3: Comparison
-    with tabs[2]:
-        st.subheader("Method Comparison")
-        
-        # Comparison chart
-        comp_data = []
-        for cat in seat_matrix.keys():
-            comp_data.append({
-                'Category': cat,
-                'Expected': int(seat_matrix[cat]),
-                'Hamilton': int(results['hamilton'][cat].sum()),
-                'Biproportional': int(results['biproportional'][cat].sum())
-            })
-        
-        df_comp = pd.DataFrame(comp_data)
-        st.dataframe(df_comp, use_container_width=True)
-        
-        # Bar chart
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=df_comp['Category'],
-            y=df_comp['Expected'],
-            name='Expected',
-            marker_color='#1f77b4'
-        ))
-        fig.add_trace(go.Bar(
-            x=df_comp['Category'],
-            y=df_comp['Hamilton'],
-            name='Hamilton',
-            marker_color='#2ca02c'
-        ))
-        fig.add_trace(go.Bar(
-            x=df_comp['Category'],
-            y=df_comp['Biproportional'],
-            name='Biproportional',
-            marker_color='#ff7f0e'
-        ))
-        fig.update_layout(
-            title='Seat Allocation Comparison',
-            barmode='group',
-            height=500,
-            xaxis_title='Category',
-            yaxis_title='Number of Seats'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Pie charts showing distribution
-        col1, col2 = st.columns(2)
-        with col1:
-            fig_pie = px.pie(
-                df_comp,
-                values='Hamilton',
-                names='Category',
-                title='Hamilton Distribution'
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
-        
-        with col2:
-            fig_pie = px.pie(
-                df_comp,
-                values='Biproportional',
-                names='Category',
-                title='Biproportional Distribution'
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
+    fig = px.bar(
+        top_colleges,
+        x='College',
+        y='Seats',
+        title=f'Top {top_n} Colleges by Seat Allocation',
+        color='Seats',
+        color_continuous_scale='Viridis',
+        text='Seats'
+    )
+    fig.update_traces(textposition='outside')
+    fig.update_layout(height=500)
     
-    # Tab 4: Download
-    with tabs[3]:
-        st.subheader("📥 Download Results")
-        
-        # Prepare download data
-        download_data = []
-        for method in ['hamilton', 'biproportional']:
-            for cat in seat_matrix.keys():
-                matrix = results[method][cat]
-                for i, c in enumerate(colleges):
-                    for j, s in enumerate(specialties):
-                        if matrix[i, j] > 0:
-                            download_data.append({
-                                'Method': method.capitalize(),
-                                'Category': cat,
-                                'College': c,
-                                'Specialty': s,
-                                'Seats': int(matrix[i, j])
-                            })
-        
-        df_download = pd.DataFrame(download_data)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            csv = df_download.to_csv(index=False)
-            st.download_button(
-                "📥 Download CSV",
-                csv,
-                f"allocations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "text/csv",
-                use_container_width=True
-            )
-        with col2:
-            json_str = json.dumps({
-                'timestamp': datetime.now().isoformat(),
-                'seat_matrix': seat_matrix,
-                'total_seats': sum(seat_matrix.values()),
-                'colleges': list(colleges),
-                'specialties': list(specialties),
-                'results': {
-                    m: {c: results[m][c].tolist() for c in results[m].keys()}
-                    for m in ['hamilton', 'biproportional']
-                }
-            }, indent=2)
-            st.download_button(
-                "📥 Download JSON",
-                json_str,
-                f"allocations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                "application/json",
-                use_container_width=True
-            )
-        
-        # Show total summary
-        st.subheader("Summary Statistics")
-        total_summary = []
-        for method in ['hamilton', 'biproportional']:
-            total = sum(results[method][cat].sum() for cat in seat_matrix.keys())
-            total_summary.append({
-                'Method': method.capitalize(),
-                'Total Allocated': int(total),
-                'Total Expected': sum(seat_matrix.values()),
-                'Difference': int(total - sum(seat_matrix.values()))
-            })
-        st.dataframe(pd.DataFrame(total_summary), use_container_width=True)
+    return fig
+
+def create_specialty_chart(specialty_summary, top_n=15):
+    """Create specialty distribution chart"""
+    top_specialties = specialty_summary.head(top_n)
+    
+    fig = px.bar(
+        top_specialties,
+        x='Specialty',
+        y='Seats',
+        title=f'Top {top_n} Specialties by Seat Allocation',
+        color='Seats',
+        color_continuous_scale='Plasma',
+        text='Seats'
+    )
+    fig.update_traces(textposition='outside')
+    fig.update_layout(height=500)
+    
+    return fig
+
+def create_heatmap(data, category_col='Category', value_col='Seats'):
+    """Create heatmap of allocations"""
+    pivot = data.pivot_table(
+        index='College',
+        columns='Category',
+        values='Seats',
+        fill_value=0,
+        aggfunc='sum'
+    )
+    
+    # Filter to top colleges and categories for readability
+    top_colleges = data.groupby('College')['Seats'].sum().nlargest(20).index
+    top_categories = data.groupby('Category')['Seats'].sum().nlargest(10).index
+    
+    pivot = pivot.loc[top_colleges, top_categories]
+    
+    fig = px.imshow(
+        pivot,
+        title='Seat Allocation Heatmap (Top 20 Colleges x Top 10 Categories)',
+        color_continuous_scale='Viridis',
+        text_auto=True,
+        aspect='auto',
+        height=600
+    )
+    fig.update_layout(
+        xaxis_title='Category',
+        yaxis_title='College'
+    )
+    
+    return fig
+
+def create_sunburst_chart(data):
+    """Create sunburst chart"""
+    fig = px.sunburst(
+        data,
+        path=['Program', 'Specialty', 'College', 'Category'],
+        values='Seats',
+        title='Seat Allocation Hierarchy',
+        color='Category',
+        height=600
+    )
+    
+    return fig
 
 # ============================================================================
 # MAIN APP
@@ -410,20 +752,13 @@ def display_results(results, colleges, specialties, seat_matrix):
 
 def main():
     # Initialize session state
-    if 'calculated' not in st.session_state:
-        st.session_state.calculated = False
-    if 'results' not in st.session_state:
-        st.session_state.results = None
-    if 'colleges' not in st.session_state:
-        st.session_state.colleges = None
-    if 'specialties' not in st.session_state:
-        st.session_state.specialties = None
-    if 'seat_matrix' not in st.session_state:
-        st.session_state.seat_matrix = None
+    if 'data' not in st.session_state:
+        st.session_state.data = None
+    if 'processed' not in st.session_state:
+        st.session_state.processed = None
     
-    # Header
     st.title("🎓 Seat Allocation System")
-    st.markdown("### Hamilton Rounding vs Biproportional Method")
+    st.markdown("### View and Analyze Seat Allocation Data")
     st.divider()
     
     # Sidebar
@@ -434,15 +769,15 @@ def main():
         st.subheader("📁 Data Input")
         input_type = st.radio(
             "Choose input method:",
-            ["Sample Data", "Upload CSV", "Manual Entry"]
+            ["Sample Data", "Upload CSV", "Paste Data"]
         )
         
         data = None
         
         if input_type == "Sample Data":
             data = get_sample_data()
-            st.success("✅ Using sample data")
-            st.dataframe(data, use_container_width=True)
+            st.success(f"✅ Loaded {len(data)} rows")
+            st.dataframe(data.head(10), use_container_width=True)
         
         elif input_type == "Upload CSV":
             uploaded = st.file_uploader("Upload CSV", type=['csv'])
@@ -450,136 +785,307 @@ def main():
                 try:
                     data = pd.read_csv(uploaded)
                     st.success(f"✅ Loaded {len(data)} rows")
-                    st.dataframe(data, use_container_width=True)
+                    st.dataframe(data.head(10), use_container_width=True)
                 except Exception as e:
                     st.error(f"❌ Error: {e}")
         
-        else:  # Manual Entry
-            st.info("✏️ Enter data manually")
-            n = st.number_input("Number of rows", min_value=1, max_value=50, value=3)
-            
-            rows = []
-            for i in range(n):
-                cols = st.columns(5)
-                with cols[0]:
-                    prog = st.text_input(f"Program {i+1}", f"P{i+1}", key=f"p{i}")
-                with cols[1]:
-                    spec = st.text_input(f"Specialty {i+1}", f"S{i+1}", key=f"s{i}")
-                with cols[2]:
-                    col = st.text_input(f"College {i+1}", f"C{i+1}", key=f"c{i}")
-                with cols[3]:
-                    seat = st.number_input(f"Seats {i+1}", 1, 1000, 1, key=f"st{i}")
-                with cols[4]:
-                    typ = st.text_input(f"Type {i+1}", "G", key=f"t{i}")
-                rows.append({'Program': prog, 'Specialty': spec, 'College': col, 'Seats': seat, 'Type': typ})
-                st.markdown("---")
-            
-            if rows:
-                data = pd.DataFrame(rows)
+        else:  # Paste Data
+            st.info("📝 Paste your CSV data below")
+            text_data = st.text_area("CSV Data", height=200)
+            if text_data:
+                try:
+                    data = pd.read_csv(StringIO(text_data))
+                    st.success(f"✅ Loaded {len(data)} rows")
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
         
-        # Seat Matrix Configuration
-        if data is not None and not data.empty:
-            st.subheader("🎯 Seat Matrix")
+        if data is not None:
+            st.session_state.data = data
             
-            # Auto-detect or manual
-            matrix_option = st.radio(
-                "Seat matrix configuration:",
-                ["Auto-detect from data", "Manual configuration"]
-            )
-            
-            if matrix_option == "Auto-detect from data":
-                seat_matrix = detect_seat_matrix_from_data(data)
-                st.success(f"Detected {len(seat_matrix)} categories")
-                st.dataframe(
-                    pd.DataFrame(list(seat_matrix.items()), columns=['Category', 'Seats']),
-                    use_container_width=True
-                )
-            else:
-                # Manual configuration
-                categories = data['Program'].unique()
-                seat_matrix = {}
-                st.info("Enter seats per category")
-                cols = st.columns(3)
-                for i, cat in enumerate(categories):
-                    with cols[i % 3]:
-                        seats = st.number_input(
-                            f"{cat} seats",
-                            min_value=1,
-                            value=int(data[data['Program'] == cat]['Seats'].sum()),
-                            key=f"matrix_{cat}"
-                        )
-                        seat_matrix[cat] = seats
-                
-                st.dataframe(
-                    pd.DataFrame(list(seat_matrix.items()), columns=['Category', 'Seats']),
-                    use_container_width=True
-                )
-            
-            # Calculate button
-            if st.button("🚀 Calculate Allocations", type="primary", use_container_width=True):
-                if data is not None and not data.empty and seat_matrix is not None:
-                    try:
-                        with st.spinner("🔄 Calculating allocations..."):
-                            allocator = SeatAllocator(data, seat_matrix)
-                            results, colleges, specialties = allocator.calculate_allocations()
-                            
-                            st.session_state.results = results
-                            st.session_state.colleges = colleges
-                            st.session_state.specialties = specialties
-                            st.session_state.seat_matrix = seat_matrix
-                            st.session_state.calculated = True
-                            
-                        st.success("✅ Allocations calculated successfully!")
-                        st.balloons()
-                    except Exception as e:
-                        st.error(f"❌ Error: {e}")
-                        st.exception(e)
-                else:
-                    st.warning("⚠️ Please provide valid data")
+            # Process data
+            if st.button("📊 Process Data", type="primary", use_container_width=True):
+                with st.spinner("Processing data..."):
+                    processed = process_allocated_data(data)
+                    st.session_state.processed = processed
+                    st.success("✅ Data processed successfully!")
+                    st.balloons()
     
     # Main content
-    if st.session_state.calculated and st.session_state.results is not None:
-        display_results(
-            st.session_state.results,
-            st.session_state.colleges,
-            st.session_state.specialties,
-            st.session_state.seat_matrix
-        )
-    else:
-        st.info("👈 Configure your data in the sidebar and click 'Calculate Allocations'")
+    if st.session_state.processed is not None:
+        processed = st.session_state.processed
+        data = st.session_state.data
         
-        # Show how it works
-        col1, col2 = st.columns(2)
-        
+        # Metrics
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
-            st.markdown("""
-            ### 📊 Hamilton Method
-            - **Largest remainder method**
-            - Simple and transparent
-            - Good for proportional allocation
-            - Easy to understand and explain
-            """)
-        
+            st.metric("Total Seats", processed['total_seats'])
         with col2:
-            st.markdown("""
-            ### ⚖️ Biproportional Method
-            - **Iterative proportional fitting**
-            - Balances row and column constraints
-            - More precise for complex scenarios
-            - Handles multiple constraints
-            """)
+            st.metric("Categories", processed['total_categories'])
+        with col3:
+            st.metric("Colleges", processed['total_colleges'])
+        with col4:
+            st.metric("Specialties", processed['total_specialties'])
+        with col5:
+            expected_total = sum(SEAT_MATRIX.values())
+            diff = processed['total_seats'] - expected_total
+            st.metric(
+                "vs Expected", 
+                f"{processed['total_seats'] - expected_total:+d}",
+                delta_color="inverse"
+            )
         
-        # Feature highlights
-        st.subheader("✨ Features")
-        features = st.columns(4)
-        with features[0]:
-            st.markdown("📁 **Multiple Inputs**\nCSV, Manual, Sample")
-        with features[1]:
-            st.markdown("📊 **Visualizations**\nCharts, Heatmaps, Tables")
-        with features[2]:
-            st.markdown("📥 **Export**\nCSV and JSON downloads")
-        with features[3]:
-            st.markdown("🎯 **Auto-detect**\nSmart category detection")
+        # Validation
+        validation_df = validate_allocations(data)
+        
+        # Tabs
+        tabs = st.tabs([
+            "📊 Summary",
+            "📈 Category Analysis",
+            "🏛️ College Analysis",
+            "📚 Specialty Analysis",
+            "🔍 Detailed View",
+            "📋 Validation",
+            "📥 Download"
+        ])
+        
+        # Tab 1: Summary
+        with tabs[0]:
+            st.subheader("Summary Statistics")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("#### Category Summary")
+                st.dataframe(processed['category_summary'], use_container_width=True)
+                
+                st.markdown("#### Program Summary")
+                st.dataframe(processed['program_summary'], use_container_width=True)
+            
+            with col2:
+                st.markdown("#### Top 10 Colleges")
+                st.dataframe(processed['college_summary'].head(10), use_container_width=True)
+                
+                st.markdown("#### Top 10 Specialties")
+                st.dataframe(processed['specialty_summary'].head(10), use_container_width=True)
+        
+        # Tab 2: Category Analysis
+        with tabs[1]:
+            st.subheader("Category-wise Analysis")
+            
+            # Category chart
+            fig = create_category_chart(processed['category_summary'])
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Category breakdown table
+            st.markdown("#### Detailed Category Breakdown")
+            
+            # Pivot table for categories
+            cat_pivot = data.pivot_table(
+                index='Category',
+                columns='Specialty',
+                values='Seats',
+                fill_value=0,
+                aggfunc='sum'
+            )
+            st.dataframe(cat_pivot, use_container_width=True)
+        
+        # Tab 3: College Analysis
+        with tabs[2]:
+            st.subheader("College-wise Analysis")
+            
+            # College chart
+            fig = create_college_chart(processed['college_summary'])
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # College-Category breakdown
+            st.markdown("#### College-Category Breakdown")
+            college_cat = data.pivot_table(
+                index='College',
+                columns='Category',
+                values='Seats',
+                fill_value=0,
+                aggfunc='sum'
+            )
+            st.dataframe(college_cat, use_container_width=True)
+            
+            # College-Specialty breakdown
+            st.markdown("#### College-Specialty Breakdown")
+            college_spec = data.pivot_table(
+                index='College',
+                columns='Specialty',
+                values='Seats',
+                fill_value=0,
+                aggfunc='sum'
+            )
+            st.dataframe(college_spec, use_container_width=True)
+        
+        # Tab 4: Specialty Analysis
+        with tabs[3]:
+            st.subheader("Specialty-wise Analysis")
+            
+            # Specialty chart
+            fig = create_specialty_chart(processed['specialty_summary'])
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Specialty-Category breakdown
+            st.markdown("#### Specialty-Category Breakdown")
+            spec_cat = data.pivot_table(
+                index='Specialty',
+                columns='Category',
+                values='Seats',
+                fill_value=0,
+                aggfunc='sum'
+            )
+            st.dataframe(spec_cat, use_container_width=True)
+        
+        # Tab 5: Detailed View
+        with tabs[4]:
+            st.subheader("Detailed Data View")
+            
+            # Heatmap
+            st.markdown("#### Allocation Heatmap")
+            fig = create_heatmap(data)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Sunburst
+            st.markdown("#### Hierarchical View")
+            fig = create_sunburst_chart(data)
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # All data
+            st.markdown("#### All Data")
+            st.dataframe(data, use_container_width=True)
+        
+        # Tab 6: Validation
+        with tabs[5]:
+            st.subheader("Data Validation")
+            
+            st.markdown("""
+            This section validates the allocation against the expected seat matrix:
+            - **SM**: 50 seats
+            - **EW**: 10 seats
+            - **EZ**: 9 seats
+            - **MU**: 8 seats
+            - **SC**: 8 seats
+            - **BH**: 3 seats
+            - **LA**: 3 seats
+            - **DV**: 2 seats
+            - **VK**: 2 seats
+            - **ST**: 2 seats
+            - **KN**: 1 seat
+            - **BX**: 1 seat
+            - **KU**: 1 seat
+            """)
+            
+            # Validation results
+            st.dataframe(
+                validation_df.style.applymap(
+                    lambda x: 'color: green' if x == '✅' else 'color: orange' if x == '⚠️' else '',
+                    subset=['Status']
+                ),
+                use_container_width=True
+            )
+            
+            # Show validation summary
+            if (validation_df['Difference'] == 0).all():
+                st.success("✅ All allocations match the expected seat matrix exactly!")
+            else:
+                st.warning("⚠️ Some allocations differ from the expected seat matrix")
+                
+                # Show mismatches
+                mismatches = validation_df[validation_df['Difference'] != 0]
+                if not mismatches.empty:
+                    st.markdown("#### Mismatches found:")
+                    st.dataframe(mismatches, use_container_width=True)
+        
+        # Tab 7: Download
+        with tabs[6]:
+            st.subheader("📥 Download Results")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Download CSV
+                csv = data.to_csv(index=False)
+                st.download_button(
+                    "📥 Download Full Data as CSV",
+                    csv,
+                    f"seat_allocation_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    "text/csv",
+                    use_container_width=True
+                )
+            
+            with col2:
+                # Download JSON
+                json_data = {
+                    'timestamp': datetime.now().isoformat(),
+                    'seat_matrix': SEAT_MATRIX,
+                    'total_seats': processed['total_seats'],
+                    'summary': {
+                        'category_summary': processed['category_summary'].to_dict('records'),
+                        'college_summary': processed['college_summary'].to_dict('records'),
+                        'specialty_summary': processed['specialty_summary'].to_dict('records')
+                    },
+                    'data': data.to_dict('records')
+                }
+                json_str = json.dumps(json_data, indent=2)
+                st.download_button(
+                    "📥 Download as JSON",
+                    json_str,
+                    f"seat_allocation_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    "application/json",
+                    use_container_width=True
+                )
+            
+            # Download validation report
+            st.markdown("#### Download Validation Report")
+            validation_csv = validation_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Validation Report",
+                validation_csv,
+                f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+    
+    else:
+        # Welcome message
+        st.info("👈 Load your data in the sidebar and click 'Process Data'")
+        
+        st.markdown("""
+        ### 📋 How to Use This Application
+        
+        1. **Load Data**: Upload a CSV file or use sample data
+        2. **Process**: Click 'Process Data' to analyze
+        3. **Explore**: View results across multiple tabs
+        4. **Export**: Download results in CSV or JSON format
+        
+        ### 📁 Required Data Format
+        
+        Your CSV should have these columns:
+        - **Program**: Program code (e.g., E)
+        - **Specialty**: Specialty name
+        - **College**: College name
+        - **Type**: Type (e.g., G)
+        - **Category**: Seat category (SM, EW, EZ, etc.)
+        - **Seats**: Number of seats
+        
+        ### 🎯 Expected Seat Matrix
+        
+        - **SM**: 50 seats
+        - **EW**: 10 seats
+        - **EZ**: 9 seats
+        - **MU**: 8 seats
+        - **SC**: 8 seats
+        - **BH**: 3 seats
+        - **LA**: 3 seats
+        - **DV**: 2 seats
+        - **VK**: 2 seats
+        - **ST**: 2 seats
+        - **KN**: 1 seat
+        - **BX**: 1 seat
+        - **KU**: 1 seat
+        """)
 
 # ============================================================================
 # RUN APP
