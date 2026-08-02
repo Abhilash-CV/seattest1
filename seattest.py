@@ -131,13 +131,19 @@ class SeatAllocator:
         if len(proportions) == 0 or total_seats <= 0:
             return np.zeros(len(proportions), dtype=int)
         
+        # Ensure proportions sum to 1
+        proportions = np.array(proportions)
+        proportions = proportions / proportions.sum()
+        
         initial_seats = np.floor(proportions * total_seats).astype(int)
         remainder = proportions * total_seats - initial_seats
         remaining_seats = total_seats - initial_seats.sum()
         
         if remaining_seats > 0:
-            largest_remainder_indices = np.argsort(remainder)[-remaining_seats:]
-            initial_seats[largest_remainder_indices] += 1
+            # Sort indices by remainder in descending order
+            sorted_indices = np.argsort(remainder)[::-1]
+            for i in range(min(remaining_seats, len(sorted_indices))):
+                initial_seats[sorted_indices[i]] += 1
         
         return initial_seats
     
@@ -148,23 +154,28 @@ class SeatAllocator:
         if n_rows == 0 or n_cols == 0:
             return np.zeros((n_rows, n_cols), dtype=int)
         
+        # Initialize with uniform distribution
         matrix = np.ones((n_rows, n_cols))
         
         for iteration in range(max_iterations):
+            # Scale rows
             row_sums = matrix.sum(axis=1)
             for i in range(n_rows):
                 if row_sums[i] > 0:
                     matrix[i, :] *= row_margins[i] / row_sums[i]
             
+            # Scale columns
             col_sums = matrix.sum(axis=0)
             for j in range(n_cols):
                 if col_sums[j] > 0:
                     matrix[:, j] *= col_margins[j] / col_sums[j]
             
+            # Check convergence
             if np.allclose(matrix.sum(axis=1), row_margins, rtol=tolerance) and \
                np.allclose(matrix.sum(axis=0), col_margins, rtol=tolerance):
                 break
         
+        # Round to integers
         rounded_matrix = np.zeros_like(matrix)
         for i in range(n_rows):
             if matrix[i, :].sum() > 0:
@@ -242,17 +253,23 @@ class SeatAllocator:
                 row_margins = np.round(row_margins).astype(int)
                 col_margins = np.round(col_margins).astype(int)
                 
-                while row_margins.sum() != category_total and row_margins.sum() > 0:
-                    if row_margins.sum() < category_total:
-                        row_margins[np.argmax(college_seats)] += 1
-                    else:
-                        row_margins[np.argmin(college_seats)] -= 1
+                # Ensure row margins sum to category total
+                row_diff = category_total - row_margins.sum()
+                if row_diff != 0:
+                    for _ in range(abs(row_diff)):
+                        if row_diff > 0:
+                            row_margins[np.argmax(college_seats)] += 1
+                        else:
+                            row_margins[np.argmin(college_seats)] -= 1
                 
-                while col_margins.sum() != category_total and col_margins.sum() > 0:
-                    if col_margins.sum() < category_total:
-                        col_margins[np.argmax(specialty_seats)] += 1
-                    else:
-                        col_margins[np.argmin(specialty_seats)] -= 1
+                # Ensure column margins sum to category total
+                col_diff = category_total - col_margins.sum()
+                if col_diff != 0:
+                    for _ in range(abs(col_diff)):
+                        if col_diff > 0:
+                            col_margins[np.argmax(specialty_seats)] += 1
+                        else:
+                            col_margins[np.argmin(specialty_seats)] -= 1
                 
                 bipro_matrix = self.biproportional_allocation(row_margins, col_margins)
             else:
@@ -337,9 +354,9 @@ def display_results_tabs(results, colleges, specialties):
             total = matrix.sum()
             ham_summary.append({
                 'Category': category,
-                'Allocated': total,
+                'Allocated': int(total),
                 'Expected': SEAT_MATRIX[category],
-                'Difference': total - SEAT_MATRIX[category],
+                'Difference': int(total - SEAT_MATRIX[category]),
                 'Accuracy': f"{(total/SEAT_MATRIX[category]*100):.1f}%" if SEAT_MATRIX[category] > 0 else "N/A"
             })
         
@@ -368,9 +385,9 @@ def display_results_tabs(results, colleges, specialties):
             total = matrix.sum()
             bipro_summary.append({
                 'Category': category,
-                'Allocated': total,
+                'Allocated': int(total),
                 'Expected': SEAT_MATRIX[category],
-                'Difference': total - SEAT_MATRIX[category],
+                'Difference': int(total - SEAT_MATRIX[category]),
                 'Accuracy': f"{(total/SEAT_MATRIX[category]*100):.1f}%" if SEAT_MATRIX[category] > 0 else "N/A"
             })
         
@@ -395,10 +412,10 @@ def display_results_tabs(results, colleges, specialties):
             comparison_data.append({
                 'Category': category,
                 'Expected': expected,
-                'Hamilton': ham_total,
-                'Biproportional': bipro_total,
-                'Hamilton Diff': ham_total - expected,
-                'Biproportional Diff': bipro_total - expected,
+                'Hamilton': int(ham_total),
+                'Biproportional': int(bipro_total),
+                'Hamilton Diff': int(ham_total - expected),
+                'Biproportional Diff': int(bipro_total - expected),
                 'Better Method': 'Hamilton' if abs(ham_total - expected) < abs(bipro_total - expected) else 'Biproportional'
             })
         
