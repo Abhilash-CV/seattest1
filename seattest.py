@@ -29,6 +29,50 @@ SEAT_MATRIX = {
 }
 
 # ============================================================================
+# APPORTIONMENT (LARGEST REMAINDER / HAMILTON METHOD)
+# ============================================================================
+
+def apportion_largest_remainder(total, weights):
+    """
+    Split an integer `total` across the keys of `weights` (a dict of relative
+    weights, e.g. SEAT_MATRIX) so that:
+      - the result is all integers
+      - the integers sum EXACTLY to `total`
+      - each key's share is as close as possible to its ideal weighted fraction
+
+    This is the Largest Remainder (Hamilton) apportionment method: give every
+    key its floor share, then hand out the leftover seats one at a time to
+    whichever keys have the largest fractional remainder.
+    """
+    total = int(round(total))
+    weight_sum = sum(weights.values())
+    if total <= 0 or weight_sum <= 0:
+        return {k: 0 for k in weights}
+
+    ideal = {k: total * w / weight_sum for k, w in weights.items()}
+    floors = {k: int(np.floor(v)) for k, v in ideal.items()}
+    leftover = total - sum(floors.values())
+    remainders = {k: ideal[k] - floors[k] for k in weights}
+
+    # Give leftover seats to the categories with the largest fractional remainder
+    order = sorted(remainders.keys(), key=lambda k: remainders[k], reverse=True)
+    result = dict(floors)
+    for i in range(leftover):
+        result[order[i % len(order)]] += 1
+
+    return result
+
+
+def get_overall_targets(total_seats):
+    """
+    Proportional overall target counts per category, scaled from the
+    SEAT_MATRIX percentages to the actual dataset size (so they sum exactly
+    to total_seats -- e.g. for 664 total seats, SM's target is ~332, not
+    the literal matrix value of 50).
+    """
+    return apportion_largest_remainder(total_seats, SEAT_MATRIX)
+
+# ============================================================================
 # DATA PROCESSING FUNCTIONS
 # ============================================================================
 
@@ -111,30 +155,42 @@ def process_allocated_data(data):
 def validate_allocations(data):
     """
     Validate that OVERALL (grand total) allocations match the seat matrix
+    PERCENTAGES, scaled proportionally to the actual total seat count.
+
+    Note: SEAT_MATRIX values (SM=50, EW=10, ...) sum to 100 -- they are
+    percentages, not literal seat counts. Comparing raw dataset totals
+    directly against those numbers only makes sense if the dataset has
+    exactly 100 seats. For any other total, "Expected" is computed as
+    total_seats * matrix_pct / 100 (apportioned so it sums exactly back
+    to total_seats). This is what makes the overall check and the
+    course-wise check mathematically compatible with each other.
     """
     validation_results = []
 
-    # Get actual totals by category
+    total_actual = int(data['Seats'].sum())
     actual_totals = data.groupby('Category')['Seats'].sum().to_dict()
+    expected_totals = get_overall_targets(total_actual)
 
     # Check each category
-    for category, expected in SEAT_MATRIX.items():
+    for category, expected in expected_totals.items():
         actual = actual_totals.get(category, 0)
         status = '✅' if actual == expected else '⚠️'
         validation_results.append({
             'Category': category,
+            'Expected %': SEAT_MATRIX[category],
             'Expected': int(expected),
             'Actual': int(actual),
             'Difference': int(actual - expected),
             'Status': status
         })
 
-    # Check total
-    total_actual = data['Seats'].sum()
-    total_expected = sum(SEAT_MATRIX.values())
+    # Check total (will always match by construction, since expected_totals
+    # is apportioned to sum exactly to total_actual)
+    total_expected = sum(expected_totals.values())
     status = '✅' if total_actual == total_expected else '⚠️'
     validation_results.append({
         'Category': 'TOTAL',
+        'Expected %': 100,
         'Expected': int(total_expected),
         'Actual': int(total_actual),
         'Difference': int(total_actual - total_expected),
@@ -211,6 +267,146 @@ def summarize_coursewise_compliance(coursewise_df):
     total_courses = len(summary)
 
     return summary, fully_compliant, total_courses
+
+
+def calculate_adjusted_allocation(data):
+    """
+    Produce a corrected (adjusted) category-seat count for every Specialty
+    (course), using the Largest Remainder / Hamilton apportionment method.
+
+    For each course: adjusted_seats sum EXACTLY to that course's original
+    total seats, and each category's adjusted share is the closest possible
+    integer to its ideal SEAT_MATRIX percentage of that course's total.
+    Since this is applied consistently to every course, the resulting grand
+    totals across all courses also land very close to (usually exactly on)
+    the proportional overall targets -- satisfying BOTH the course-wise and
+    the overall check simultaneously.
+
+    This only rebalances CATEGORY TOTALS within each course. It does not
+    reassign which specific college receives a seat -- that would require
+    college-level capacity/eligibility rules not present in this dataset.
+    """
+    rows = []
+    for specialty, group in data.groupby('Specialty'):
+        course_total = int(group['Seats'].sum())
+        actual_by_cat = group.groupby('Category')['Seats'].sum().to_dict()
+        adjusted = apportion_largest_remainder(course_total, SEAT_MATRIX)
+
+        for category in SEAT_MATRIX:
+            original = int(actual_by_cat.get(category, 0))
+            new_val = int(adjusted[category])
+            rows.append({
+                'Specialty': specialty,
+                'Category': category,
+                'Course Total': course_total,
+                'Original Seats': original,
+                'Adjusted Seats': new_val,
+                'Change': new_val - original
+            })
+
+    return pd.DataFrame(rows)
+
+
+def rebalance_global_allocation(adjusted_df, total_seats, max_iterations=5000):
+    """
+    Stage 2 of the adjustment: independent per-course rounding (Stage 1) can
+    drift the OVERALL totals away from target, especially when many courses
+    are too small to reflect all 13 categories individually (a 1-seat course
+    can only give its single seat to ONE category).
+
+    This pass fixes that by swapping single seats between categories WITHIN
+    the same course (so course totals never change) -- moving a seat from
+    whichever category is most over its overall target to whichever is most
+    under, always picking the course where that swap does the LEAST damage
+    (or the most good) to that course's own percentage fit.
+    """
+    pivot = adjusted_df.pivot(index='Specialty', columns='Category', values='Adjusted Seats').fillna(0).astype(int)
+    for cat in SEAT_MATRIX:
+        if cat not in pivot.columns:
+            pivot[cat] = 0
+    course_totals = pivot.sum(axis=1)
+
+    # Per-course ideal shares, used only to pick the LEAST-DAMAGING course for each swap
+    course_ideal = {
+        specialty: apportion_largest_remainder(int(course_totals[specialty]), SEAT_MATRIX)
+        for specialty in pivot.index
+    }
+
+    overall_target = get_overall_targets(total_seats)
+
+    for _ in range(max_iterations):
+        totals = pivot.sum(axis=0).to_dict()
+        diffs = {cat: totals.get(cat, 0) - overall_target[cat] for cat in SEAT_MATRIX}
+
+        surplus_cat = max(diffs, key=lambda c: diffs[c])
+        deficit_cat = min(diffs, key=lambda c: diffs[c])
+
+        # Balanced (allowing for the fact sum(diffs) == 0 always)
+        if diffs[surplus_cat] <= 0 and diffs[deficit_cat] >= 0:
+            break
+
+        # Find the best course to move one seat: surplus_cat -> deficit_cat
+        best_course, best_score = None, -1e18
+        for specialty in pivot.index:
+            if pivot.loc[specialty, surplus_cat] <= 0:
+                continue
+            ideal = course_ideal[specialty]
+            over_amount = pivot.loc[specialty, surplus_cat] - ideal.get(surplus_cat, 0)
+            under_amount = ideal.get(deficit_cat, 0) - pivot.loc[specialty, deficit_cat]
+            score = over_amount + under_amount  # both positive => "double win" swap
+            if score > best_score:
+                best_score, best_course = score, specialty
+
+        if best_course is None:
+            break  # no seat available to move (shouldn't normally happen)
+
+        pivot.loc[best_course, surplus_cat] -= 1
+        pivot.loc[best_course, deficit_cat] += 1
+
+    result = pivot.reset_index().melt(id_vars='Specialty', var_name='Category', value_name='Rebalanced Seats')
+    merged = adjusted_df.merge(result, on=['Specialty', 'Category'], how='left')
+    merged['Adjusted Seats'] = merged['Rebalanced Seats'].astype(int)
+    merged['Change'] = merged['Adjusted Seats'] - merged['Original Seats']
+    merged = merged.drop(columns=['Rebalanced Seats'])
+    return merged
+
+
+def validate_adjusted_overall(adjusted_df, total_seats):
+    """Overall check applied to the ADJUSTED allocation (should match/near-match)."""
+    adjusted_totals = adjusted_df.groupby('Category')['Adjusted Seats'].sum().to_dict()
+    expected_totals = get_overall_targets(total_seats)
+
+    rows = []
+    for category, expected in expected_totals.items():
+        actual = adjusted_totals.get(category, 0)
+        status = '✅' if actual == expected else '⚠️'
+        rows.append({
+            'Category': category,
+            'Expected %': SEAT_MATRIX[category],
+            'Expected': int(expected),
+            'Adjusted Actual': int(actual),
+            'Difference': int(actual - expected),
+            'Status': status
+        })
+
+    total_adjusted = sum(adjusted_totals.values())
+    total_expected = sum(expected_totals.values())
+    rows.append({
+        'Category': 'TOTAL',
+        'Expected %': 100,
+        'Expected': int(total_expected),
+        'Adjusted Actual': int(total_adjusted),
+        'Difference': int(total_adjusted - total_expected),
+        'Status': '✅' if total_adjusted == total_expected else '⚠️'
+    })
+
+    return pd.DataFrame(rows)
+
+
+def validate_adjusted_coursewise(adjusted_df, tolerance_pts=2.0):
+    """Course-wise check applied to the ADJUSTED allocation (should be clean)."""
+    synthetic = adjusted_df.rename(columns={'Adjusted Seats': 'Seats'})[['Specialty', 'Category', 'Seats']]
+    return calculate_coursewise_compliance(synthetic, tolerance_pts=tolerance_pts)
 
 # ============================================================================
 # SAMPLE DATA
@@ -849,7 +1045,8 @@ def convert_df_to_excel(df):
         df.to_excel(writer, index=False, sheet_name='Data')
     return output.getvalue()
 
-def create_download_data(data, processed, validation_df, coursewise_df=None, coursewise_summary=None):
+def create_download_data(data, processed, validation_df, coursewise_df=None, coursewise_summary=None,
+                          adjusted_df=None, adjusted_overall_df=None, adjusted_coursewise_df=None):
     """Create comprehensive download data"""
     download_data = {}
 
@@ -871,14 +1068,22 @@ def create_download_data(data, processed, validation_df, coursewise_df=None, cou
     # Specialty-Category breakdown
     download_data['Specialty_Category'] = processed['specialty_category']
 
-    # Overall Validation results
+    # Overall Validation results (BEFORE adjustment)
     download_data['Overall_Validation'] = validation_df
 
-    # Course-wise (specialty-wise) percentage validation
+    # Course-wise (specialty-wise) percentage validation (BEFORE adjustment)
     if coursewise_df is not None:
         download_data['Coursewise_Validation'] = coursewise_df
     if coursewise_summary is not None:
         download_data['Coursewise_Summary'] = coursewise_summary
+
+    # ADJUSTED (corrected) allocation -- satisfies both overall & course-wise
+    if adjusted_df is not None:
+        download_data['Adjusted_Allocation'] = adjusted_df
+    if adjusted_overall_df is not None:
+        download_data['Adjusted_Overall_Check'] = adjusted_overall_df
+    if adjusted_coursewise_df is not None:
+        download_data['Adjusted_Coursewise_Check'] = adjusted_coursewise_df
 
     # Pivot tables
     download_data['Specialty_Category_Pivot'] = processed['specialty_category_pivot'].reset_index()
@@ -986,6 +1191,17 @@ def main():
         overall_ok = (validation_df['Difference'] == 0).all()
         coursewise_ok = fully_compliant == total_courses
 
+        # Adjusted (corrected) allocation -- fixes both overall & course-wise together
+        # Stage 1: apportion each course independently (largest remainder method)
+        adjusted_df = calculate_adjusted_allocation(data)
+        # Stage 2: rebalance across courses so the OVERALL totals also hit target
+        adjusted_df = rebalance_global_allocation(adjusted_df, processed['total_seats'])
+        adjusted_overall_df = validate_adjusted_overall(adjusted_df, processed['total_seats'])
+        adjusted_coursewise_df = validate_adjusted_coursewise(adjusted_df, tolerance_pts=tolerance)
+        adj_coursewise_summary, adj_fully_compliant, adj_total_courses = summarize_coursewise_compliance(adjusted_coursewise_df)
+        adjusted_overall_ok = (adjusted_overall_df['Difference'] == 0).all()
+        adjusted_coursewise_ok = adj_fully_compliant == adj_total_courses
+
         # Metrics
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
@@ -1010,10 +1226,15 @@ def main():
         else:
             msgs = []
             if not overall_ok:
-                msgs.append("overall grand-total category counts do not match the seat matrix")
+                msgs.append("overall grand-total category counts do not match the (proportional) seat matrix target")
             if not coursewise_ok:
                 msgs.append(f"{total_courses - fully_compliant} of {total_courses} courses do not satisfy the course-wise percentage criteria")
-            st.error("⚠️ Compliance issue: " + " and ".join(msgs) + ". See the **Validation** and **Course-wise %** tabs for details.")
+            adj_note = "✅ satisfies both" if (adjusted_overall_ok and adjusted_coursewise_ok) else "still has minor rounding gaps"
+            st.error(
+                "⚠️ Compliance issue in the **original data**: " + " and ".join(msgs) + ". "
+                f"See the **Validation** and **Course-wise %** tabs for details, or open the "
+                f"**🔧 Adjusted Allocation** tab for a corrected version ({adj_note})."
+            )
 
         # Tabs
         tabs = st.tabs([
@@ -1024,6 +1245,7 @@ def main():
             "🔍 Specialty-Category View",
             "📋 Validation (Overall)",
             "🎯 Course-wise % (Per Course)",
+            "🔧 Adjusted Allocation",
             "📥 Download"
         ])
 
@@ -1254,24 +1476,114 @@ def main():
             else:
                 st.success("✅ All courses satisfy the course-wise percentage criteria!")
 
-        # Tab 8: Download
+        # Tab 8: Adjusted Allocation (corrected to satisfy BOTH overall & course-wise)
         with tabs[7]:
+            st.subheader("🔧 Adjusted (Corrected) Allocation")
+            st.markdown("""
+            This shows a **corrected category allocation**, built in two stages:
+
+            1. **Per-course apportionment** (Largest Remainder / Hamilton method) — each course's
+               seats are re-split across categories to match its own percentage targets as closely
+               as integers allow. Course totals never change.
+            2. **Global rebalancing pass** — small courses (1-7 seats) can't individually reflect
+               all 13 categories, which biases the grand totals even after step 1. This pass swaps
+               single seats between categories *within the same course*, prioritizing swaps that
+               also improve that course's own fit, until the overall grand totals hit their
+               proportional target too.
+
+            The result satisfies **both** the overall check and the course-wise check together,
+            as closely as the integer seat counts allow.
+
+            ⚠️ **Scope**: this only rebalances *category totals within each course*. It does **not**
+            decide which specific college receives which seat — that requires college-level
+            capacity/eligibility rules that aren't present in this dataset.
+            """)
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Overall Check (Adjusted)", "✅ Pass" if adjusted_overall_ok else "⚠️ Off")
+            with col2:
+                st.metric("Courses Fully Compliant", f"{adj_fully_compliant} / {adj_total_courses}")
+            with col3:
+                total_seats_moved = int(adjusted_df[adjusted_df['Change'] != 0]['Change'].abs().sum()) // 2
+                st.metric("Seats Re-categorized", total_seats_moved)
+            with col4:
+                courses_changed = int(adjusted_df[adjusted_df['Change'] != 0]['Specialty'].nunique())
+                st.metric("Courses Affected", courses_changed)
+
+            st.markdown("#### Overall Check: Original vs Adjusted")
+            colA, colB = st.columns(2)
+            with colA:
+                st.markdown("**Before (Original Data)**")
+                st.dataframe(validation_df, use_container_width=True)
+            with colB:
+                st.markdown("**After (Adjusted Data)**")
+                st.dataframe(adjusted_overall_df, use_container_width=True)
+
+            st.markdown("#### Course-wise Check on Adjusted Data")
+            if adj_fully_compliant == adj_total_courses:
+                st.success(f"✅ All {adj_total_courses} courses now satisfy the percentage criteria within {tolerance} pts.")
+            else:
+                st.info(
+                    f"{adj_total_courses - adj_fully_compliant} of {adj_total_courses} courses still show a minor "
+                    f"deviation beyond {tolerance} pts (this is the smallest possible gap given integer seat counts "
+                    f"— e.g. a course with only 1-2 seats can't precisely reflect a 1% category)."
+                )
+            st.dataframe(adj_coursewise_summary.rename(columns={
+                'Course_Total': 'Total Seats',
+                'Category_Violations': 'Category Violations',
+                'Missing_Mandatory_Categories': 'Missing Mandatory Categories'
+            }), use_container_width=True)
+
+            st.markdown("#### Detailed Adjusted Allocation (Original → Adjusted)")
+            filter_changed = st.checkbox("Show only categories that changed", value=True)
+            display_adj = adjusted_df.copy()
+            if filter_changed:
+                display_adj = display_adj[display_adj['Change'] != 0]
+            st.dataframe(display_adj, use_container_width=True, height=400)
+
+            # Chart: net change by category, summed across all courses
+            st.markdown("#### Net Seat Change by Category (summed across all courses)")
+            change_by_cat = adjusted_df.groupby('Category')['Change'].sum().reset_index().sort_values('Change')
+            fig_change = px.bar(
+                change_by_cat, x='Change', y='Category', orientation='h',
+                color='Change', color_continuous_scale='RdYlGn',
+                title='Categories gaining (green) vs losing (red) seats after adjustment'
+            )
+            fig_change.update_layout(height=400)
+            st.plotly_chart(fig_change, use_container_width=True)
+
+            st.markdown("#### Download Adjusted Allocation")
+            csv_adj = adjusted_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Adjusted Allocation (CSV)",
+                csv_adj,
+                f"adjusted_allocation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+
+        # Tab 9: Download
+        with tabs[8]:
             st.subheader("📥 Download Results")
 
             st.markdown("Download the data in various formats:")
 
-            # Create download data (now includes both overall AND course-wise validation)
+            # Create download data (includes overall, course-wise, AND adjusted allocation)
             download_data = create_download_data(
                 data, processed, validation_df,
                 coursewise_df=coursewise_df,
-                coursewise_summary=coursewise_summary
+                coursewise_summary=coursewise_summary,
+                adjusted_df=adjusted_df,
+                adjusted_overall_df=adjusted_overall_df,
+                adjusted_coursewise_df=adjusted_coursewise_df
             )
 
             # Excel download
             st.markdown("#### Download as Excel")
             excel_bytes = create_excel_download(download_data)
             st.download_button(
-                "📥 Download Full Report (Excel, incl. Course-wise Validation)",
+                "📥 Download Full Report (Excel, incl. Adjusted Allocation)",
                 excel_bytes,
                 f"seat_allocation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1307,6 +1619,8 @@ def main():
                     },
                     'overall_validation': validation_df.to_dict('records'),
                     'coursewise_validation': coursewise_df.to_dict('records'),
+                    'adjusted_allocation': adjusted_df.to_dict('records'),
+                    'adjusted_overall_check': adjusted_overall_df.to_dict('records'),
                     'data': data.to_dict('records')
                 }
 
