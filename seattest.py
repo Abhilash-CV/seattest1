@@ -36,10 +36,8 @@ class SeatAllocator:
             # Get all unique categories from data
             categories = self.college_data['Program'].unique()
             # Calculate seats per category based on total seats
-            total_seats = self.college_data['Seats'].sum()
-            # Distribute proportionally based on category counts
-            category_counts = self.college_data.groupby('Program')['Seats'].sum()
-            self.seat_matrix = category_counts.to_dict()
+            category_counts = self.college_data.groupby('Program')['Seats'].sum().to_dict()
+            self.seat_matrix = category_counts
         else:
             self.seat_matrix = seat_matrix
         
@@ -411,6 +409,18 @@ def display_results(results, colleges, specialties, seat_matrix):
 # ============================================================================
 
 def main():
+    # Initialize session state
+    if 'calculated' not in st.session_state:
+        st.session_state.calculated = False
+    if 'results' not in st.session_state:
+        st.session_state.results = None
+    if 'colleges' not in st.session_state:
+        st.session_state.colleges = None
+    if 'specialties' not in st.session_state:
+        st.session_state.specialties = None
+    if 'seat_matrix' not in st.session_state:
+        st.session_state.seat_matrix = None
+    
     # Header
     st.title("🎓 Seat Allocation System")
     st.markdown("### Hamilton Rounding vs Biproportional Method")
@@ -507,17 +517,17 @@ def main():
             
             # Calculate button
             if st.button("🚀 Calculate Allocations", type="primary", use_container_width=True):
-                if data is not None and not data.empty:
+                if data is not None and not data.empty and seat_matrix is not None:
                     try:
                         with st.spinner("🔄 Calculating allocations..."):
                             allocator = SeatAllocator(data, seat_matrix)
                             results, colleges, specialties = allocator.calculate_allocations()
                             
-                            st.session_state['results'] = results
-                            st.session_state['colleges'] = colleges
-                            st.session_state['specialties'] = specialties
-                            st.session_state['seat_matrix'] = seat_matrix
-                            st.session_state['calculated'] = True
+                            st.session_state.results = results
+                            st.session_state.colleges = colleges
+                            st.session_state.specialties = specialties
+                            st.session_state.seat_matrix = seat_matrix
+                            st.session_state.calculated = True
                             
                         st.success("✅ Allocations calculated successfully!")
                         st.balloons()
@@ -528,12 +538,12 @@ def main():
                     st.warning("⚠️ Please provide valid data")
     
     # Main content
-    if st.session_state.get('calculated', False) and st.session_state.get('results'):
+    if st.session_state.calculated and st.session_state.results is not None:
         display_results(
-            st.session_state['results'],
-            st.session_state['colleges'],
-            st.session_state['specialties'],
-            st.session_state['seat_matrix']
+            st.session_state.results,
+            st.session_state.colleges,
+            st.session_state.specialties,
+            st.session_state.seat_matrix
         )
     else:
         st.info("👈 Configure your data in the sidebar and click 'Calculate Allocations'")
